@@ -1,0 +1,24 @@
+[package]
+name = "omni-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omni-types = { path = "../omni-types" }
+omni-catalog = { path = "../omni-catalog" }
+omni-translate = { path = "../omni-translate" }
+omni-oauth = { path = "../omni-oauth" }
+chrono.workspace = true
+flate2.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true

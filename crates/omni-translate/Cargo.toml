@@ -1,0 +1,10 @@
+[package]
+name = "omni-translate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omni-types = { path = "../omni-types" }
+serde_json.workspace = true

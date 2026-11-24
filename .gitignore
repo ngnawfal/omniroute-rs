@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Runtime SQLite databases & local data (may contain API keys / OAuth tokens)
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Upstream reference clone (separate git repository)
+/repo/
+
+# Local environment secrets & exported chat sessions
+.env
+.env.*
+omp-session-*.html
+*.log
+.DS_Store
+Thumbs.db

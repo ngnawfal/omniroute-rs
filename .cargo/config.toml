@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\MinGW\\bin\\g++.exe"
+rustflags = ["-L", "C:\\Users\\kaysa\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\self-contained"]

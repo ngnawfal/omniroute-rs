@@ -1,0 +1,14 @@
+[package]
+name = "omni-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+omni-types = { path = "../omni-types" }
+omni-catalog = { path = "../omni-catalog" }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
