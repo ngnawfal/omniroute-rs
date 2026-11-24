@@ -1,11 +1,14 @@
-// MITM proxy — port of src/mitm core paths (targets registry + connect
-// routing + hostname resolution), Rust-native TLS interception foundation.
+// MITM proxy — full Rust-native HTTP CONNECT + dynamic TLS interception engine
+// + 10-agent targets registry + pure-Rust ECDSA P-256 Root CA & per-host leaf certs.
 //
-// Architecture (mirrors manager.ts + server.cjs):
-//   CONNECT capture → SNI hostname → resolveTarget:
-//     bypass      — user patterns, straight TCP relay
-//     target      — matched agent host: terminate TLS, inspect body, forward
-//     passthrough — no match: TCP relay untouched
+// Architecture (mirrors src/mitm/manager.ts + server.cjs):
+//   CONNECT host:port -> routeConnection:
+//     bypass      -> straight zero-copy TCP tunnel
+//     target      -> dynamic leaf cert + rustls TLS termination -> intercept & route to local OmniRoute gateway
+//     passthrough -> straight zero-copy TCP tunnel untouched
+
+pub mod cert;
+pub mod proxy;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,13 +32,13 @@ pub enum ConnectionRoute {
 /// ALL_TARGETS ports (10-agents registry).
 pub fn all_targets() -> Vec<MitmTarget> {
     vec![
-        MitmTarget { id: "antigravity".into(), name: "Antigravity".into(), hosts: vec!["antigravity.googleapis.com".into()], port: 443, endpoint_patterns: vec!["/v1/chat/completions".into()] },
+        MitmTarget { id: "antigravity".into(), name: "Antigravity".into(), hosts: vec!["antigravity.googleapis.com".into(), "cloudcode-pa.googleapis.com".into()], port: 443, endpoint_patterns: vec!["/v1/chat/completions".into(), "/v1internal".into()] },
         MitmTarget { id: "kiro".into(), name: "Kiro".into(), hosts: vec!["kiro.dev".into(), "codewhisperer.us-east-1.amazonaws.com".into()], port: 443, endpoint_patterns: vec!["/v1/chat/completions".into()] },
-        MitmTarget { id: "copilot".into(), name: "GitHub Copilot".into(), hosts: vec!["api.business.githubcopilot.com".into(), "api.githubcopilot.com".into()], port: 443, endpoint_patterns: vec!["/chat/completions".into()] },
+        MitmTarget { id: "copilot".into(), name: "GitHub Copilot".into(), hosts: vec!["api.business.githubcopilot.com".into(), "api.githubcopilot.com".into()], port: 443, endpoint_patterns: vec!["/chat/completions".into(), "/v1/messages".into(), "/responses".into()] },
         MitmTarget { id: "ghe-copilot".into(), name: "GHE Copilot".into(), hosts: vec!["ghe-copilot.com".into()], port: 443, endpoint_patterns: vec![] },
-        MitmTarget { id: "codex".into(), name: "Codex".into(), hosts: vec!["chatgpt.com".into()], port: 443, endpoint_patterns: vec!["/backend-api/code".into(), "/v1/chat/completions".into()] },
+        MitmTarget { id: "codex".into(), name: "Codex".into(), hosts: vec!["chatgpt.com".into()], port: 443, endpoint_patterns: vec!["/backend-api/code".into(), "/backend-api/codex".into(), "/v1/chat/completions".into()] },
         MitmTarget { id: "cursor".into(), name: "Cursor".into(), hosts: vec!["api2.cursor.sh".into(), "api3.cursor.sh".into()], port: 443, endpoint_patterns: vec!["/v1/chat/completions".into()] },
-        MitmTarget { id: "zed".into(), name: "Zed".into(), hosts: vec!["api.zed.dev".into()], port: 443, endpoint_patterns: vec![] },
+        MitmTarget { id: "zed".into(), name: "Zed".into(), hosts: vec!["api.zed.dev".into(), "cloud.zed.dev".into()], port: 443, endpoint_patterns: vec![] },
         MitmTarget { id: "claude-code".into(), name: "Claude Code".into(), hosts: vec!["api.anthropic.com".into()], port: 443, endpoint_patterns: vec!["/v1/messages".into()] },
         MitmTarget { id: "open-code".into(), name: "OpenCode".into(), hosts: vec!["opencode.ai".into()], port: 443, endpoint_patterns: vec!["/v1/chat/completions".into()] },
         MitmTarget { id: "trae".into(), name: "Trae".into(), hosts: vec!["api.trae.ai".into()], port: 443, endpoint_patterns: vec![] },
@@ -51,14 +54,10 @@ pub fn resolve_target(hostname: &str) -> Option<MitmTarget> {
 }
 
 /// routeConnection: bypass patterns > target match > passthrough.
-/// case-insensitive, glob not used (exact per-target hosts).
 pub fn route_connection(hostname: &str, user_bypass: &[String]) -> ConnectionRoute {
     if !hostname.is_empty() {
         let h = hostname.to_lowercase();
-        if user_bypass
-            .iter()
-            .any(|p| p.to_lowercase() == h)
-        {
+        if user_bypass.iter().any(|p| p.to_lowercase() == h) {
             return ConnectionRoute::Bypass {
                 reason: "bypass".into(),
             };
@@ -78,30 +77,27 @@ pub fn target_matches_path(target: &MitmTarget, path: &str) -> bool {
         .any(|p| path.starts_with(p))
 }
 
-/// Should-keepalive decision — from detection/*.
 pub fn is_connect_target_host(hostline: &str) -> bool {
     let host = hostline.split(':').next().unwrap_or(hostline);
     let _host = host.to_lowercase();
-    true // connect targets any host; routing decides next
+    true
 }
 
-/// Aggregated gate state (manager.ts orchestrator summary).
 #[derive(Debug, Clone, Default)]
 pub struct MitmGateState {
-    pub dns_entries: HashMap<String, String>, // host → target_ip
+    pub dns_entries: HashMap<String, String>,
     pub cert_dir: Option<String>,
     pub active_targets: Vec<String>,
     pub bypass_patterns: Vec<String>,
 }
 
 impl MitmGateState {
-    /// puppet-target registration after cert provisioning succeeded.
     pub fn add_target(&mut self, id: &str) {
         if !self.active_targets.contains(&id.to_string()) {
             self.active_targets.push(id.to_string());
         }
     }
-    /// Compute repair plan differences (repair.ts buildRepairPlan port).
+
     pub fn repair_needed(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.cert_dir.is_none() {
@@ -110,12 +106,6 @@ impl MitmGateState {
         if self.dns_entries.is_empty() && !self.active_targets.is_empty() {
             out.push("provision_dns");
         }
-        for t in &self.active_targets {
-            match t.as_str() {
-                "claude-code" | "codex" | "copilot" => {}
-                _ => {}
-            }
-        }
         if self.bypass_patterns.is_empty() {
             out.push("reload_bypass");
         }
@@ -123,7 +113,6 @@ impl MitmGateState {
     }
 }
 
-/// Upstream CA env/state wiring (upstreamTrust.ts — env var wins over stored).
 pub fn resolve_upstream_ca_path(env_var: Option<String>, stored: Option<String>) -> Option<String> {
     env_var.or(stored)
 }
@@ -131,6 +120,15 @@ pub fn resolve_upstream_ca_path(env_var: Option<String>, stored: Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cert::CertAuthority;
+    use crate::proxy::{MitmProxyConfig, MitmProxyHandle};
+    use axum::routing::post;
+    use axum::Router;
+    use rustls_pki_types::{CertificateDer, ServerName};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
 
     #[test]
     fn target_resolves_opencode() {
@@ -160,11 +158,11 @@ mod tests {
         }
         match route_connection("opencode.ai", &[]) {
             ConnectionRoute::Target(t) => assert_eq!(t.id, "open-code"),
-            _ => panic!("no bypass → target"),
+            _ => panic!("no bypass -> target"),
         }
         match route_connection("random.host", &[]) {
             ConnectionRoute::Passthrough => {}
-            _ => panic!("unknown host → passthrough"),
+            _ => panic!("unknown host -> passthrough"),
         }
     }
 
@@ -186,15 +184,8 @@ mod tests {
         g.active_targets = vec!["open-code".into()];
         assert!(g.repair_needed().contains(&"provision_dns"));
         g.dns_entries.insert("opencode.ai".into(), "127.0.0.1".into());
-        g.repair_needed();
-        assert!(g.add_target_check_passes());
-    }
-
-    impl MitmGateState {
-        fn add_target_check_passes(&mut self) -> bool {
-            self.add_target("open-code");
-            self.active_targets.len() == 1
-        }
+        g.add_target("open-code");
+        assert_eq!(g.active_targets.len(), 1);
     }
 
     #[test]
@@ -208,5 +199,113 @@ mod tests {
             Some("db.pth".into())
         );
         assert_eq!(resolve_upstream_ca_path(None, None), None);
+    }
+
+    #[test]
+    fn pure_rust_ca_and_leaf_cert_generation_and_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "omni-mitm-ca-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let ca1 = CertAuthority::load_or_create(&dir).unwrap();
+        let fp1 = ca1.ca_fingerprint_sha256();
+        assert_eq!(fp1.len(), 64);
+        assert!(ca1.ca_cert_pem().contains("BEGIN CERTIFICATE"));
+
+        let ca2 = CertAuthority::load_or_create(&dir).unwrap();
+        assert_eq!(ca2.ca_fingerprint_sha256(), fp1, "CA must persist on disk");
+
+        let cfg = ca2.build_server_config_for_host("api.anthropic.com").unwrap();
+        assert!(Arc::strong_count(&cfg) >= 1);
+        assert_eq!(ca2.cached_leaf_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn live_tls_connect_mitm_intercepts_anthropic_and_routes_to_gateway() {
+        // 1. Start mock local OmniRoute gateway accepting /v1/messages
+        let gw_app = Router::new().route(
+            "/v1/messages",
+            post(|headers: axum::http::HeaderMap, body: String| async move {
+                let intercepted = headers
+                    .get("x-omniroute-mitm-intercepted")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("0");
+                serde_json::json!({
+                    "intercepted": intercepted,
+                    "echo_len": body.len(),
+                    "ok": true
+                })
+                .to_string()
+            }),
+        );
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_port = gw_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(gw_listener, gw_app).await;
+        });
+
+        // 2. Start real TCP/TLS HTTP CONNECT MITM proxy
+        let ca = Arc::new(CertAuthority::generate().unwrap());
+        let handle = MitmProxyHandle::start(
+            ca.clone(),
+            MitmProxyConfig {
+                bind_addr: "127.0.0.1:0".into(),
+                gateway_base_url: format!("http://127.0.0.1:{gw_port}"),
+                bypass_patterns: vec![],
+                extra_targets: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        // 3. Connect as a real HTTPS proxy client trusting our generated Root CA
+        let mut tcp = TcpStream::connect(handle.bind_addr()).await.unwrap();
+        tcp.write_all(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut connect_buf = [0u8; 256];
+        let n = tcp.read(&mut connect_buf).await.unwrap();
+        let connect_resp = String::from_utf8_lossy(&connect_buf[..n]);
+        assert!(connect_resp.contains("200 Connection Established"), "{connect_resp}");
+
+        // 4. Perform real TLS handshake with SNI = api.anthropic.com verifying leaf cert against Root CA!
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca.ca_cert_der().to_vec()))
+            .unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+        let server_name = ServerName::try_from("api.anthropic.com").unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+        let payload = r#"{"model":"claude-opus-4-7","messages":[{"role":"user","content":"hi mitm"}]}"#;
+        let http_req = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        tls.write_all(http_req.as_bytes()).await.unwrap();
+        tls.flush().await.unwrap();
+
+        let mut resp_bytes = Vec::new();
+        let _ = tls.read_to_end(&mut resp_bytes).await;
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        assert!(resp_str.contains("200 OK"), "{resp_str}");
+        assert!(resp_str.contains("X-OmniRoute-MITM: intercepted"), "{resp_str}");
+        assert!(resp_str.contains("\"intercepted\":\"1\""), "{resp_str}");
+
+        let stats = handle.stats();
+        assert_eq!(stats.intercepted_requests, 1);
+        assert_eq!(stats.last_intercept_host.as_deref(), Some("api.anthropic.com"));
+        assert_eq!(stats.last_intercept_path.as_deref(), Some("/v1/messages"));
+
+        handle.stop();
     }
 }

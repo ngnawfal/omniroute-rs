@@ -5,14 +5,17 @@
 //   omniroute-rs mcp       Run JSON-RPC 2.0 MCP server over stdio
 //   omniroute-rs version   Print binary & upstream catalog sync version
 
+mod a2a;
 mod api;
 mod chat;
+mod cli;
 mod extended;
+mod memory_skills;
 mod oauth_api;
 mod state;
 mod status;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use state::{AppState, SharedState};
 use std::sync::Arc;
@@ -93,7 +96,43 @@ pub fn build_router(app_state: SharedState) -> Router {
         .route("/api/guardrails/status", get(api::guardrails_status))
         .route("/api/guardrails/patterns", post(api::add_guardrail_pattern))
         .route("/api/gamification/status", get(api::gamification_status))
+        // Live TLS/HTTP CONNECT MITM Proxy controls
         .route("/api/mitm/targets", get(api::mitm_targets))
+        .route("/api/mitm/status", get(api::mitm_targets))
+        .route("/api/mitm/ca.crt", get(api::mitm_ca_cert))
+        .route("/api/mitm/start", post(api::mitm_start))
+        .route("/api/mitm/stop", post(api::mitm_stop))
+        .route("/api/mitm/regenerate-cert", post(api::mitm_regenerate_cert))
+        .route("/api/mitm/bypass", put(api::mitm_set_bypass))
+        // A2A v0.3 (+ v1.0 compat) Protocol & Tasks API
+        .route("/.well-known/agent.json", get(a2a::agent_card))
+        .route("/a2a", post(a2a::a2a_rpc))
+        .route("/api/a2a/status", get(a2a::a2a_status))
+        .route("/api/a2a/tasks", get(a2a::list_a2a_tasks))
+        .route("/api/a2a/tasks/{id}", get(a2a::get_a2a_task))
+        .route("/api/a2a/tasks/{id}/cancel", post(a2a::cancel_a2a_task))
+        // Persistent Agent Memory & Skills Registry
+        .route(
+            "/api/memory",
+            get(memory_skills::list_memories).post(memory_skills::create_memory),
+        )
+        .route("/api/memory/health", get(memory_skills::memory_health))
+        .route("/api/memory/retrieve", post(memory_skills::retrieve_memories))
+        .route(
+            "/api/memory/{id}",
+            get(memory_skills::get_memory)
+                .put(memory_skills::update_memory)
+                .delete(memory_skills::delete_memory),
+        )
+        .route(
+            "/api/skills",
+            get(memory_skills::list_skills).post(memory_skills::upsert_skill),
+        )
+        .route(
+            "/api/skills/{id}",
+            get(memory_skills::get_skill).delete(memory_skills::delete_skill),
+        )
+        .route("/api/skills/{id}/execute", post(memory_skills::execute_skill))
         // OAuth 2.0 PKCE / Device-Code / Refresh / Background Sweep
         .route("/api/oauth/providers", get(oauth_api::list_oauth_providers))
         .route("/api/oauth/sweep", post(oauth_api::trigger_oauth_sweep))
@@ -117,28 +156,11 @@ pub fn build_router(app_state: SharedState) -> Router {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let subcmd = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
-
     let data_dir = std::env::var("OMNIROUTE_DATA_DIR").unwrap_or_else(|_| "./data".into());
 
-    if matches!(subcmd, "version" | "--version" | "-V") {
-        let cat = omni_catalog::Catalog::with_seed();
-        println!(
-            "omniroute-rs {} (upstream OmniRoute v{}, {} providers, {} models)",
-            env!("CARGO_PKG_VERSION"),
-            omni_catalog::upstream_version(),
-            cat.provider_count(),
-            cat.model_count()
-        );
+    let Some((port, mitm_port)) = cli::run_cli(&args, &data_dir).await? else {
         return Ok(());
-    }
-
-    if subcmd == "mcp" {
-        let app_state = Arc::new(AppState::open(&data_dir)?);
-        let ctx = api::ServerMcpContext { state: app_state };
-        omni_mcp::run_stdio_blocking(&ctx)?;
-        return Ok(());
-    }
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -147,13 +169,30 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let port: u16 = std::env::var("OMNIROUTE_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20128);
-
     let app_state = Arc::new(AppState::open(&data_dir)?);
     oauth_api::spawn_oauth_refresh_scheduler(app_state.clone());
+
+    if let Some(mp) = mitm_port {
+        let ca = app_state.mitm_ca.read().unwrap().clone();
+        match omni_mitm::proxy::MitmProxyHandle::start(
+            ca,
+            omni_mitm::proxy::MitmProxyConfig {
+                bind_addr: format!("127.0.0.1:{mp}"),
+                gateway_base_url: format!("http://127.0.0.1:{port}"),
+                bypass_patterns: vec![],
+                extra_targets: vec![],
+            },
+        )
+        .await
+        {
+            Ok(h) => {
+                tracing::info!("MITM TLS/CONNECT proxy listening on http://{}", h.bind_addr());
+                *app_state.mitm_handle.lock().unwrap() = Some(h);
+            }
+            Err(e) => tracing::warn!("MITM proxy failed to start on port {mp}: {e}"),
+        }
+    }
+
     let (p_cnt, m_cnt) = {
         let c = app_state.catalog.read().unwrap();
         (c.provider_count(), c.model_count())
@@ -1035,5 +1074,206 @@ mod tests {
         assert_eq!(bed_json["choices"][0]["message"]["content"], "bedrock-sigv4-converse-ok");
         assert_eq!(bed_json["usage"]["total_tokens"], 16);
         assert_eq!(bedrock_sigv4_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn phase5_a2a_v03_v10_memory_skills_and_live_mitm_control_e2e() {
+        let (base, st) = spawn_test_server().await;
+        let client = reqwest::Client::new();
+
+        // 1. Install a custom skill and verify Agent Card advertises 6 built-in + 1 installed skill
+        let sk_res = client
+            .post(format!("{base}/api/skills"))
+            .json(&json!({
+                "name": "rust-reviewer",
+                "description": "Reviews Rust crates for zero-copy safety",
+                "tags": ["rust", "review"],
+                "instructions": "Check ownership, lifetimes, and unsafe blocks"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sk_res.status(), 201);
+
+        let card: Value = client
+            .get(format!("{base}/.well-known/agent.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(card["protocolVersion"], "0.3");
+        let skills_arr = card["skills"].as_array().unwrap();
+        assert!(skills_arr.len() >= 7);
+        assert!(skills_arr.iter().any(|s| s["id"] == "rust-reviewer"));
+
+        // 2. Seed two API keys to verify GHSA-jcm5-6wpp-wjj8 cross-owner A2A isolation
+        st.store.add_api_key("sk-owner-a", "a", 1_000).unwrap();
+        st.store.add_api_key("sk-owner-b", "b", 1_000).unwrap();
+
+        // v0.3 message/send with owner A
+        let r_a2a: Value = client
+            .post(format!("{base}/a2a"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": "req-1",
+                "method": "message/send",
+                "params": {
+                    "skill": "rust-reviewer",
+                    "messages": [{"role": "user", "content": "Review omni-mitm"}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r_a2a["result"]["task"]["state"], "completed");
+        let task_id = r_a2a["result"]["task"]["id"].as_str().unwrap().to_string();
+
+        // Owner A can fetch task; Owner B gets 404
+        let get_a = client
+            .get(format!("{base}/api/a2a/tasks/{task_id}"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_a.status(), 200);
+        let get_b = client
+            .get(format!("{base}/api/a2a/tasks/{task_id}"))
+            .header("Authorization", "Bearer sk-owner-b")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_b.status(), 404);
+
+        // v1.0 compatibility SendMessage returns TASK_STATE_COMPLETED + status.message.parts[].text
+        let r_v1: Value = client
+            .post(format!("{base}/a2a"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": "req-v1",
+                "method": "SendMessage",
+                "params": {
+                    "skill": "health-report",
+                    "contextId": "ctx-99",
+                    "message": {"role": "user", "parts": [{"text": "status?"}]}
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r_v1["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(r_v1["result"]["task"]["contextId"], "ctx-99");
+        assert!(r_v1["result"]["task"]["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("healthy"));
+
+        // v0.3 message/stream returns SSE task events
+        let r_stream = client
+            .post(format!("{base}/a2a"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": "req-sse",
+                "method": "message/stream",
+                "params": {
+                    "skill": "list-capabilities",
+                    "messages": [{"role": "user", "content": "what can you do?"}]
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(r_stream.contains("event: task.status"));
+        assert!(r_stream.contains("event: task.completed"));
+
+        // 3. Persistent Memory CRUD + TF-cosine retrieval
+        let m_create: Value = client
+            .post(format!("{base}/api/memory"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .json(&json!({
+                "key": "deploy-target",
+                "type": "factual",
+                "category": "ops",
+                "content": "Production gateway runs native Rust binary on port 20128 with SQLite WAL"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(m_create["success"], true);
+
+        let m_ret: Value = client
+            .post(format!("{base}/api/memory/retrieve"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .json(&json!({"query": "native Rust binary port 20128", "top_k": 3}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(m_ret["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(m_ret["matches"][0]["memory"]["mem_key"], "deploy-target");
+
+        // 4. Live MITM control plane: CA download, start on port 0, bypass update, cert rotation, stop
+        let ca_pem = client
+            .get(format!("{base}/api/mitm/ca.crt"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(ca_pem.contains("BEGIN CERTIFICATE"));
+
+        let started: Value = client
+            .post(format!("{base}/api/mitm/start"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .json(&json!({"port": 0, "gateway_base_url": base}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(started["running"], true);
+        let fp1 = started["ca_fingerprint_sha256"].as_str().unwrap().to_string();
+
+        let rotated: Value = client
+            .post(format!("{base}/api/mitm/regenerate-cert"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_ne!(rotated["ca_fingerprint_sha256"].as_str().unwrap(), fp1);
+
+        let stopped: Value = client
+            .post(format!("{base}/api/mitm/stop"))
+            .header("Authorization", "Bearer sk-owner-a")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stopped["running"], false);
     }
 }

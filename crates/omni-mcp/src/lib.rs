@@ -102,6 +102,9 @@ pub static TOOL_CATALOG: &[ToolDef] = &[
     ToolDef { name: "omniroute_compression_stats", description: "RTK + Caveman compression configuration and tokens-saved statistics", scope: "compression", audit: "read" },
     ToolDef { name: "omniroute_cache_stats", description: "Dual-layer semantic cache configuration, hit rate, and tokens saved", scope: "cache", audit: "read" },
     ToolDef { name: "omniroute_oauth_status", description: "OAuth provider capabilities, connected OAuth accounts, refresh breakers, and token health", scope: "oauth", audit: "read" },
+    ToolDef { name: "omniroute_memory_search", description: "Search persistent agent memories by semantic/keyword query", scope: "memory", audit: "read" },
+    ToolDef { name: "omniroute_skills_list", description: "List installed agent skills, modes, tags, and execution counts", scope: "skills", audit: "read" },
+    ToolDef { name: "omniroute_mitm_status", description: "Live TLS/HTTP CONNECT MITM proxy status, CA fingerprint, intercept counters, and targets", scope: "mitm", audit: "read" },
     ToolDef { name: "omniroute_tool_search", description: "Fuzzy discovery of MCP tools by intent keyword", scope: "meta", audit: "read" },
 ];
 
@@ -132,6 +135,9 @@ pub trait McpContext {
     fn compression_stats(&self) -> Value;
     fn cache_stats(&self) -> Value;
     fn oauth_status(&self) -> Value;
+    fn memory_search(&self, query: &str, limit: usize) -> Value;
+    fn skills_list(&self, query: Option<&str>) -> Value;
+    fn mitm_status(&self) -> Value;
 }
 
 fn tool_list_result() -> Value {
@@ -210,6 +216,16 @@ pub fn call_tool(ctx: &dyn McpContext, tool: &str, args: &Value) -> Value {
         "omniroute_compression_stats" => ctx.compression_stats(),
         "omniroute_cache_stats" => ctx.cache_stats(),
         "omniroute_oauth_status" => ctx.oauth_status(),
+        "omniroute_memory_search" => {
+            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+            ctx.memory_search(q, limit.min(100))
+        }
+        "omniroute_skills_list" => {
+            let q = args.get("query").and_then(Value::as_str);
+            ctx.skills_list(q)
+        }
+        "omniroute_mitm_status" => ctx.mitm_status(),
         "omniroute_tool_search" => {
             let q = args.get("query").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
             let hits: Vec<&ToolDef> = TOOL_CATALOG
@@ -351,6 +367,9 @@ mod tests {
         fn compression_stats(&self) -> Value { json!({"saved_tokens": 0}) }
         fn cache_stats(&self) -> Value { json!({"entries": 0}) }
         fn oauth_status(&self) -> Value { json!({"providers": 17}) }
+        fn memory_search(&self, q: &str, _l: usize) -> Value { json!({"query": q, "memories": []}) }
+        fn skills_list(&self, _q: Option<&str>) -> Value { json!({"skills": []}) }
+        fn mitm_status(&self) -> Value { json!({"running": false}) }
     }
 
     #[test]

@@ -11,6 +11,8 @@ use omni_gami::{
     BadgeState, StreakData, XpAction,
 };
 use omni_guard::AgentGuardMode;
+use omni_mitm::cert::CertAuthority;
+use omni_mitm::proxy::MitmProxyHandle;
 use omni_oauth::{OAuthSessionStore, RefreshCircuitBreaker, OAUTH_PROVIDERS};
 use omni_router::{normalize_strategy, Strategy};
 use omni_store::Store;
@@ -28,6 +30,7 @@ pub struct CompressionTotals {
 }
 
 pub struct AppState {
+    pub data_dir: String,
     pub store: Store,
     pub catalog: RwLock<Catalog>,
     pub dispatcher: Dispatcher,
@@ -40,6 +43,9 @@ pub struct AppState {
     pub compression_totals: Mutex<CompressionTotals>,
     pub oauth_sessions: OAuthSessionStore,
     pub oauth_breaker: RefreshCircuitBreaker,
+    pub mitm_ca: RwLock<Arc<CertAuthority>>,
+    pub mitm_handle: Mutex<Option<MitmProxyHandle>>,
+    pub mitm_bypass: RwLock<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,7 +62,12 @@ impl AppState {
         for p in store.list_custom_providers()? {
             catalog.add(p);
         }
+        let mitm_dir = std::path::Path::new(data_dir).join("mitm");
+        let mitm_ca = CertAuthority::load_or_create(&mitm_dir)
+            .or_else(|_| CertAuthority::generate())
+            .map_err(|e| anyhow::anyhow!("MITM CA init: {e}"))?;
         Ok(Self {
+            data_dir: data_dir.to_string(),
             store,
             catalog: RwLock::new(catalog),
             dispatcher: Dispatcher::default(),
@@ -69,6 +80,9 @@ impl AppState {
             compression_totals: Mutex::new(CompressionTotals::default()),
             oauth_sessions: OAuthSessionStore::new(),
             oauth_breaker: RefreshCircuitBreaker::new(),
+            mitm_ca: RwLock::new(Arc::new(mitm_ca)),
+            mitm_handle: Mutex::new(None),
+            mitm_bypass: RwLock::new(vec![]),
         })
     }
 
@@ -257,6 +271,37 @@ impl AppState {
             "healthcheck_disabled": omni_oauth::is_healthcheck_disabled(),
             "per_provider_concurrency": omni_oauth::healthcheck_per_provider_concurrency(),
             "google_refresh_delay_ms": omni_oauth::bg_refresh_google_delay_ms(),
+        })
+    }
+
+    pub fn a2a_enabled(&self) -> bool {
+        if let Ok(Some(v)) = self.store.get_setting("a2a_enabled") {
+            return !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no");
+        }
+        true
+    }
+
+    pub fn mitm_status_json(&self) -> serde_json::Value {
+        let ca = self.mitm_ca.read().unwrap().clone();
+        let bypass = self.mitm_bypass.read().unwrap().clone();
+        let targets = omni_mitm::all_targets();
+        let runtime = self
+            .mitm_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| h.stats());
+        serde_json::json!({
+            "mode": "live_tls_connect_proxy",
+            "running": runtime.as_ref().map(|r| r.running).unwrap_or(false),
+            "bind_addr": runtime.as_ref().and_then(|r| r.bind_addr.clone()),
+            "ca_fingerprint_sha256": ca.ca_fingerprint_sha256(),
+            "ca_download_path": "/api/mitm/ca.crt",
+            "cached_leaf_certs": ca.cached_leaf_count(),
+            "bypass_patterns": bypass,
+            "stats": runtime,
+            "target_count": targets.len(),
+            "targets": targets,
         })
     }
 

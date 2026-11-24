@@ -576,14 +576,127 @@ pub async fn gamification_status(State(state): State<SharedState>) -> Response {
     json_ok(state.gamification_summary())
 }
 
-pub async fn mitm_targets() -> Response {
-    let targets = omni_mitm::all_targets();
-    json_ok(json!({
-        "mode": "registry_only_phase_2",
-        "note": "TLS CONNECT interception proxy scheduled for Phase 5",
-        "target_count": targets.len(),
-        "targets": targets
-    }))
+pub async fn mitm_targets(State(state): State<SharedState>) -> Response {
+    json_ok(state.mitm_status_json())
+}
+
+pub async fn mitm_ca_cert(State(state): State<SharedState>) -> Response {
+    let pem = state.mitm_ca.read().unwrap().ca_cert_pem();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-pem-file")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"omniroute-mitm-ca.crt\"",
+        )
+        .body(Body::from(pem))
+        .unwrap()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StartMitmBody {
+    pub port: Option<u16>,
+    pub bind_addr: Option<String>,
+    pub gateway_base_url: Option<String>,
+}
+
+pub async fn mitm_start(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    body: Option<axum::Json<StartMitmBody>>,
+) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let bind_addr = req
+        .bind_addr
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("127.0.0.1:{}", req.port.unwrap_or(20443)));
+    let gw_port: u16 = std::env::var("OMNIROUTE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20128);
+    let gateway_base_url = req
+        .gateway_base_url
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{gw_port}"));
+
+    // Stop any previous instance cleanly before starting a new listener
+    if let Some(prev) = state.mitm_handle.lock().unwrap().take() {
+        prev.stop();
+    }
+
+    let ca = state.mitm_ca.read().unwrap().clone();
+    let bypass = state.mitm_bypass.read().unwrap().clone();
+    match omni_mitm::proxy::MitmProxyHandle::start(
+        ca,
+        omni_mitm::proxy::MitmProxyConfig {
+            bind_addr,
+            gateway_base_url,
+            bypass_patterns: bypass,
+            extra_targets: vec![],
+        },
+    )
+    .await
+    {
+        Ok(handle) => {
+            *state.mitm_handle.lock().unwrap() = Some(handle);
+            json_ok(state.mitm_status_json())
+        }
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+    }
+}
+
+pub async fn mitm_stop(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    if let Some(prev) = state.mitm_handle.lock().unwrap().take() {
+        prev.stop();
+    }
+    json_ok(state.mitm_status_json())
+}
+
+pub async fn mitm_regenerate_cert(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    match omni_mitm::cert::CertAuthority::generate() {
+        Ok(new_ca) => {
+            let mitm_dir = std::path::Path::new(&state.data_dir).join("mitm");
+            let _ = std::fs::create_dir_all(&mitm_dir);
+            let _ = std::fs::write(mitm_dir.join("ca.crt"), new_ca.ca_cert_pem());
+            let _ = std::fs::write(mitm_dir.join("ca.key"), new_ca.ca_key_pem());
+            let arc_ca = std::sync::Arc::new(new_ca);
+            *state.mitm_ca.write().unwrap() = arc_ca.clone();
+            if let Some(ref handle) = *state.mitm_handle.lock().unwrap() {
+                handle.replace_ca(arc_ca);
+            }
+            json_ok(state.mitm_status_json())
+        }
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BypassBody {
+    pub bypass_patterns: Vec<String>,
+}
+
+pub async fn mitm_set_bypass(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<BypassBody>,
+) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    *state.mitm_bypass.write().unwrap() = body.bypass_patterns.clone();
+    if let Some(ref handle) = *state.mitm_handle.lock().unwrap() {
+        handle.set_bypass_patterns(body.bypass_patterns);
+    }
+    json_ok(state.mitm_status_json())
 }
 
 // ── Compression & Semantic Cache Management APIs ────────────────────
@@ -917,6 +1030,51 @@ impl McpContext for ServerMcpContext {
 
     fn oauth_status(&self) -> Value {
         self.state.oauth_summary()
+    }
+
+    fn memory_search(&self, query: &str, limit: usize) -> Value {
+        let now = now_ms();
+        if query.trim().is_empty() {
+            let (rows, total, tokens) = self
+                .state
+                .store
+                .list_memories(None, None, None, None, None, now, limit, 0)
+                .unwrap_or((vec![], 0, 0));
+            return json!({"total": total, "tokens_used": tokens, "memories": rows});
+        }
+        let hits = self
+            .state
+            .store
+            .retrieve_memories(query, None, None, now, limit)
+            .unwrap_or_default();
+        json!({
+            "query": query,
+            "matches": hits.into_iter().map(|(m, s)| json!({"score": s, "memory": m})).collect::<Vec<_>>()
+        })
+    }
+
+    fn skills_list(&self, query: Option<&str>) -> Value {
+        let ql = query.map(|s| s.to_ascii_lowercase());
+        let skills: Vec<_> = self
+            .state
+            .store
+            .list_skills()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| {
+                ql.as_ref()
+                    .map(|q| {
+                        s.name.to_ascii_lowercase().contains(q)
+                            || s.description.to_ascii_lowercase().contains(q)
+                    })
+                    .unwrap_or(true)
+            })
+            .collect();
+        json!({"count": skills.len(), "skills": skills})
+    }
+
+    fn mitm_status(&self) -> Value {
+        self.state.mitm_status_json()
     }
 }
 

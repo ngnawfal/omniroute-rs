@@ -5,15 +5,25 @@ Port Rust dari AI Gateway [OmniRoute](https://github.com/cheaper-inference/OmniR
 ## Jalankan cepat
 
 ```bash
-# HTTP Gateway (default port 20128)
+# HTTP Gateway (default port 20128, opsional --mitm-port 20443)
 cargo run --release -p omni-server
-# atau dengan env:
-OMNIROUTE_PORT=20128 OMNIROUTE_DATA_DIR=./data ./target/release/omniroute-rs
+./target/release/omniroute-rs serve --port 20128 --mitm-port 20443
 
-# MCP Server over stdio (JSON-RPC 2.0, 21 tools)
+# MCP Server over stdio (JSON-RPC 2.0, 24 tools)
 ./target/release/omniroute-rs mcp
 
-# Cek versi & jumlah katalog tersinkron
+# Standalone live TCP/TLS HTTP CONNECT MITM proxy
+./target/release/omniroute-rs mitm --port 20443 --gateway http://127.0.0.1:20128
+
+# Utilitas CLI lengkap
+./target/release/omniroute-rs doctor
+./target/release/omniroute-rs status
+./target/release/omniroute-rs providers --free
+./target/release/omniroute-rs models --provider anthropic
+./target/release/omniroute-rs combos simulate openai/gpt-6.1-sol --strategy jev
+./target/release/omniroute-rs keys create --label dev --rpm 120
+./target/release/omniroute-rs oauth list
+./target/release/omniroute-rs memory add stack "Rust Axum + SQLite WAL"
 ./target/release/omniroute-rs version
 ```
 
@@ -57,10 +67,13 @@ cargo build --release
 | `GET /api/cache/stats`, `PUT /api/settings/cache`, `POST /api/cache/clear` | Konfigurasi & telemetri Semantic Cache (hit-rate, tokens saved) |
 | `GET /api/usage` | Analitik usage & token (termasuk cache read/write tokens) |
 | `GET /api/guardrails/status` & `POST /api/guardrails/patterns` | Prompt injection, PII masking / `PiiVault`, `agent-guard` |
-| `GET /api/gamification/status` & `GET /api/mitm/targets` | XP/level/streak/badges & registry target MITM |
+| `GET /api/gamification/status` | XP, level, tier, streak harian, dan badge |
+| `GET /api/mitm/status\|ca.crt`, `POST /api/mitm/start\|stop\|regenerate-cert`, `PUT /api/mitm/bypass` | Live TCP/TLS HTTP CONNECT MITM proxy (ECDSA P-256 CA + dynamic leaf cert) |
+| `GET /.well-known/agent.json`, `POST /a2a`, `GET /api/a2a/status\|tasks` | Protokol **A2A v0.3** (+ kompatibilitas **v1.0** `SendMessage`/`TASK_STATE_*`, isolasi owner) |
+| `GET/POST /api/memory`, `POST /api/memory/retrieve`, `GET/POST /api/skills`, `POST /api/skills/{id}/execute` | Persistent Agent Memory (TF-cosine retrieval) & Skills Registry |
 | `GET /api/oauth/providers`, `POST /api/oauth/{provider}/authorize\|callback\|poll\|import` | OAuth 2.0 PKCE & Device-Code (17 provider) + token import |
 | `POST /api/oauth/{provider}/{connection_id}/refresh` & `POST /api/oauth/sweep` | Manual refresh & background sweep (`BG_REFRESH_GOOGLE_DELAY_MS`, `TOKEN_REFRESH_RETRY_JITTER`, `HEALTHCHECK_PER_PROVIDER_CONCURRENCY`) |
-| `POST /api/mcp` | JSON-RPC 2.0 MCP Server over HTTP (**21 tools aktif**) |
+| `POST /api/mcp` | JSON-RPC 2.0 MCP Server over HTTP (**24 tools aktif**) |
 
 ## Arsitektur Workspace (14 Crates)
 
@@ -74,16 +87,15 @@ cargo build --release
 | `omni-oauth` | OAuth 2.0 PKCE (`S256`), RFC 8628 Device-Code, GitHub Copilot token exchange, Google refresh slot spacing, SHA-256 retry jitter, refresh breaker, AWS region SSRF guard |
 | `omni-router` | 22 strategi publik `v3.8.55` (`expiry-first`, `jev`, dll.) + `quota-share` + 11 auto-strategy (`decision`, dll.) |
 | `omni-exec` | HTTP dispatcher + gzip body Anthropic `>= 4096B` + 415 fallback latch + 7 executor prioritas (Claude, Codex/ChatGPT, Copilot, Antigravity/Gemini CLI, AWS Bedrock SigV4+Converse, GCP Vertex, Azure Foundry/Classic) |
-| `omni-store` | SQLite WAL (9 tabel persisten + OAuth token lifecycle, expiry, `health_status`, `health_check_interval_min`) |
+| `omni-store` | SQLite WAL (**12 tabel persisten**: API keys, credentials+OAuth, usage, custom providers, combos, settings, gamification, guardrails, aliases, **memories**, **skills**, **a2a_tasks**) |
 | `omni-guard` | Prompt injection (precompiled regex), PII masker, reversible `PiiVault`, `agent-guard` (`monitor`/`block`) |
 | `omni-gami` | XP, kurva level, tier, streak harian, badge evaluation |
-| `omni-mcp` | JSON-RPC 2.0 MCP Server (stdio & HTTP) dengan **21 tools** aktif |
-| `omni-mitm` | Registry 10 target MITM & routing decision helper |
-| `omni-server` | Binary `omniroute-rs` (Axum + CORS + Trace + Auth strict + RPM limit + background OAuth refresh scheduler + semua 13 library crate) |
+| `omni-mcp` | JSON-RPC 2.0 MCP Server (stdio & HTTP) dengan **24 tools** aktif |
+| `omni-mitm` | Live TCP/TLS HTTP CONNECT MITM proxy + pure-Rust ECDSA P-256 Root CA & dynamic leaf cert + 10-agent targets registry |
+| `omni-server` | Binary `omniroute-rs` (Axum + A2A v0.3/v1.0 + Memory/Skills + OAuth scheduler + full CLI subcommands + semua 13 library crate) |
 
 ## Cakupan Fase Lanjutan
 
-- **Fase 5:** Proxy TLS/HTTP CONNECT MITM nyata di `omni-mitm`, protokol A2A v0.3, Memory/Skills, dan subcommand CLI lengkap.
 - **Fase 6:** Kompatibilitas penuh 253 migrasi DB upstream & embedded Web Dashboard.
 
 ## Build & Test

@@ -99,6 +99,52 @@ const BASE_MIGRATIONS: &[&str] = &[
         alias TEXT PRIMARY KEY,
         target TEXT NOT NULL
     );",
+    // 10 — persistent agent memories
+    "CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        api_key_hash TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        mem_type TEXT NOT NULL DEFAULT 'factual',
+        mem_key TEXT NOT NULL,
+        content TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT '',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        tokens_est INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS memories_key_idx ON memories(api_key_hash, session_id);",
+    // 11 — installed agent skills
+    "CREATE TABLE IF NOT EXISTS skills (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL DEFAULT '',
+        source_provider TEXT NOT NULL DEFAULT 'local',
+        mode TEXT NOT NULL DEFAULT 'on',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        instructions TEXT NOT NULL DEFAULT '',
+        schema_json TEXT NOT NULL DEFAULT '{}',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        executions_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+    );",
+    // 12 — A2A v0.3/v1.0 tasks & event history
+    "CREATE TABLE IF NOT EXISTS a2a_tasks (
+        id TEXT PRIMARY KEY,
+        owner_hash TEXT NOT NULL DEFAULT '',
+        skill TEXT NOT NULL,
+        state TEXT NOT NULL,
+        input_json TEXT NOT NULL DEFAULT '{}',
+        artifacts_json TEXT NOT NULL DEFAULT '[]',
+        events_json TEXT NOT NULL DEFAULT '[]',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS a2a_tasks_owner_idx ON a2a_tasks(owner_hash, created_at);",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +269,91 @@ pub struct GuardrailEventRow {
     pub provider: String,
     pub model: String,
     pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRow {
+    pub id: String,
+    #[serde(default)]
+    pub api_key_hash: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default = "default_factual")]
+    pub mem_type: String,
+    pub mem_key: String,
+    pub content: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default = "default_empty_obj")]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub tokens_est: i64,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_factual() -> String {
+    "factual".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRow {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_local_source")]
+    pub source_provider: String,
+    #[serde(default = "default_on_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default = "default_empty_obj")]
+    pub schema: serde_json::Value,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub executions_count: i64,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_local_source() -> String {
+    "local".into()
+}
+fn default_on_mode() -> String {
+    "on".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A2ATaskRow {
+    pub id: String,
+    #[serde(default)]
+    pub owner_hash: String,
+    pub skill: String,
+    pub state: String,
+    #[serde(default = "default_empty_obj")]
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub artifacts: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+    #[serde(default = "default_empty_obj")]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub expires_at: i64,
 }
 
 fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> anyhow::Result<()> {
@@ -1063,6 +1194,422 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    // ── Memories CRUD + Semantic TF-Cosine Retrieval ────────────────
+
+    pub fn upsert_memory(&self, row: &MemoryRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tokens = if row.tokens_est > 0 {
+            row.tokens_est
+        } else {
+            ((row.content.len() as f64) / 4.0).ceil().max(1.0) as i64
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO memories(
+                id, api_key_hash, session_id, mem_type, mem_key, content, category,
+                metadata_json, tokens_est, expires_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                row.id,
+                row.api_key_hash,
+                row.session_id,
+                row.mem_type,
+                row.mem_key,
+                row.content,
+                row.category,
+                serde_json::to_string(&row.metadata)?,
+                tokens,
+                row.expires_at,
+                row.created_at,
+                row.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_memory(&self, id: &str) -> anyhow::Result<Option<MemoryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, api_key_hash, session_id, mem_type, mem_key, content, category,
+                    metadata_json, tokens_est, expires_at, created_at, updated_at
+             FROM memories WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                api_key_hash: r.get(1)?,
+                session_id: r.get(2)?,
+                mem_type: r.get(3)?,
+                mem_key: r.get(4)?,
+                content: r.get(5)?,
+                category: r.get(6)?,
+                metadata: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(serde_json::json!({})),
+                tokens_est: r.get(8)?,
+                expires_at: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_memory(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
+        Ok(n > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_memories(
+        &self,
+        api_key_hash: Option<&str>,
+        session_id: Option<&str>,
+        mem_type: Option<&str>,
+        category: Option<&str>,
+        query: Option<&str>,
+        now_ms: i64,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<MemoryRow>, usize, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, api_key_hash, session_id, mem_type, mem_key, content, category,
+                    metadata_json, tokens_est, expires_at, created_at, updated_at
+             FROM memories ORDER BY updated_at DESC",
+        )?;
+        let all: Vec<MemoryRow> = stmt
+            .query_map([], |r| {
+                Ok(MemoryRow {
+                    id: r.get(0)?,
+                    api_key_hash: r.get(1)?,
+                    session_id: r.get(2)?,
+                    mem_type: r.get(3)?,
+                    mem_key: r.get(4)?,
+                    content: r.get(5)?,
+                    category: r.get(6)?,
+                    metadata: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(serde_json::json!({})),
+                    tokens_est: r.get(8)?,
+                    expires_at: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let q_lower = query.map(|s| s.to_ascii_lowercase());
+        let filtered: Vec<MemoryRow> = all
+            .into_iter()
+            .filter(|m| {
+                if let Some(exp) = m.expires_at {
+                    if exp > 0 && now_ms > exp {
+                        return false;
+                    }
+                }
+                if let Some(kh) = api_key_hash.filter(|s| !s.is_empty()) {
+                    if m.api_key_hash != kh {
+                        return false;
+                    }
+                }
+                if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+                    if m.session_id != sid {
+                        return false;
+                    }
+                }
+                if let Some(mt) = mem_type.filter(|s| !s.is_empty()) {
+                    if !m.mem_type.eq_ignore_ascii_case(mt) {
+                        return false;
+                    }
+                }
+                if let Some(cat) = category.filter(|s| !s.is_empty()) {
+                    if !m.category.eq_ignore_ascii_case(cat) {
+                        return false;
+                    }
+                }
+                if let Some(ref ql) = q_lower {
+                    if !m.mem_key.to_ascii_lowercase().contains(ql)
+                        && !m.content.to_ascii_lowercase().contains(ql)
+                        && !m.category.to_ascii_lowercase().contains(ql)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let total = filtered.len();
+        let tokens_used: i64 = filtered.iter().map(|m| m.tokens_est).sum();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total, tokens_used))
+    }
+
+    /// Lightweight sparse word-TF cosine + substring retrieval for context injection.
+    pub fn retrieve_memories(
+        &self,
+        query: &str,
+        api_key_hash: Option<&str>,
+        session_id: Option<&str>,
+        now_ms: i64,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<(MemoryRow, f64)>> {
+        let (items, _, _) = self.list_memories(api_key_hash, session_id, None, None, None, now_ms, 500, 0)?;
+        let q_vec = tf_vector(query);
+        let q_lower = query.to_ascii_lowercase();
+        let mut scored: Vec<(MemoryRow, f64)> = items
+            .into_iter()
+            .filter_map(|m| {
+                let doc = format!("{} {} {}", m.mem_key, m.category, m.content);
+                let mut score = cosine_sim(&q_vec, &tf_vector(&doc));
+                if !q_lower.is_empty() && doc.to_ascii_lowercase().contains(&q_lower) {
+                    score = (score + 0.35).min(1.0);
+                }
+                if score > 0.05 {
+                    Some((m, score))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    // ── Skills CRUD & Executions ────────────────────────────────────
+
+    pub fn upsert_skill(&self, row: &SkillRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO skills(
+                id, name, description, source_provider, mode, tags_json,
+                instructions, schema_json, enabled, executions_count, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                row.id,
+                row.name,
+                row.description,
+                row.source_provider,
+                row.mode,
+                serde_json::to_string(&row.tags)?,
+                row.instructions,
+                serde_json::to_string(&row.schema)?,
+                if row.enabled { 1i64 } else { 0i64 },
+                row.executions_count,
+                row.created_at,
+                row.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_skill(&self, id_or_name: &str) -> anyhow::Result<Option<SkillRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, source_provider, mode, tags_json,
+                    instructions, schema_json, enabled, executions_count, created_at, updated_at
+             FROM skills WHERE id = ?1 OR name = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id_or_name], |r| {
+            Ok(SkillRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                source_provider: r.get(3)?,
+                mode: r.get(4)?,
+                tags: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                instructions: r.get(6)?,
+                schema: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(serde_json::json!({})),
+                enabled: r.get::<_, i64>(8)? != 0,
+                executions_count: r.get(9)?,
+                created_at: r.get(10)?,
+                updated_at: r.get(11)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_skills(&self) -> anyhow::Result<Vec<SkillRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, source_provider, mode, tags_json,
+                    instructions, schema_json, enabled, executions_count, created_at, updated_at
+             FROM skills ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SkillRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    description: r.get(2)?,
+                    source_provider: r.get(3)?,
+                    mode: r.get(4)?,
+                    tags: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                    instructions: r.get(6)?,
+                    schema: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(serde_json::json!({})),
+                    enabled: r.get::<_, i64>(8)? != 0,
+                    executions_count: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_skill(&self, id_or_name: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM skills WHERE id = ?1 OR name = ?1",
+            rusqlite::params![id_or_name],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn record_skill_execution(&self, id_or_name: &str, now_ms: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE skills SET executions_count = executions_count + 1, updated_at = ?1 WHERE id = ?2 OR name = ?2",
+            rusqlite::params![now_ms, id_or_name],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ── A2A Tasks Persistence (with owner scoping GHSA-jcm5-6wpp-wjj8) ─
+
+    pub fn upsert_a2a_task(&self, row: &A2ATaskRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO a2a_tasks(
+                id, owner_hash, skill, state, input_json, artifacts_json,
+                events_json, metadata_json, created_at, updated_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                row.id,
+                row.owner_hash,
+                row.skill,
+                row.state,
+                serde_json::to_string(&row.input)?,
+                serde_json::to_string(&row.artifacts)?,
+                serde_json::to_string(&row.events)?,
+                serde_json::to_string(&row.metadata)?,
+                row.created_at,
+                row.updated_at,
+                row.expires_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_a2a_task(&self, id: &str, caller_owner: &str) -> anyhow::Result<Option<A2ATaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, owner_hash, skill, state, input_json, artifacts_json,
+                    events_json, metadata_json, created_at, updated_at, expires_at
+             FROM a2a_tasks WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok(A2ATaskRow {
+                id: r.get(0)?,
+                owner_hash: r.get(1)?,
+                skill: r.get(2)?,
+                state: r.get(3)?,
+                input: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(serde_json::json!({})),
+                artifacts: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                events: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+                metadata: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(serde_json::json!({})),
+                created_at: r.get(8)?,
+                updated_at: r.get(9)?,
+                expires_at: r.get(10)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(task)) => {
+                // GHSA-jcm5-6wpp-wjj8: owner-scoped tasks are invisible to other API key owners
+                if !task.owner_hash.is_empty() && task.owner_hash != caller_owner {
+                    Ok(None)
+                } else {
+                    Ok(Some(task))
+                }
+            }
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_a2a_tasks(
+        &self,
+        caller_owner: &str,
+        state: Option<&str>,
+        skill: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<A2ATaskRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, owner_hash, skill, state, input_json, artifacts_json,
+                    events_json, metadata_json, created_at, updated_at, expires_at
+             FROM a2a_tasks ORDER BY created_at DESC",
+        )?;
+        let all: Vec<A2ATaskRow> = stmt
+            .query_map([], |r| {
+                Ok(A2ATaskRow {
+                    id: r.get(0)?,
+                    owner_hash: r.get(1)?,
+                    skill: r.get(2)?,
+                    state: r.get(3)?,
+                    input: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(serde_json::json!({})),
+                    artifacts: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                    events: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+                    metadata: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or(serde_json::json!({})),
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
+                    expires_at: r.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|t| {
+                (t.owner_hash.is_empty() || t.owner_hash == caller_owner)
+                    && state.map(|s| t.state.eq_ignore_ascii_case(s)).unwrap_or(true)
+                    && skill.map(|s| t.skill.eq_ignore_ascii_case(s)).unwrap_or(true)
+            })
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+}
+
+fn tf_vector(text: &str) -> HashMap<String, f64> {
+    let mut map = HashMap::new();
+    for tok in text
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| s.len() >= 2)
+    {
+        *map.entry(tok.to_string()).or_insert(0.0) += 1.0;
+    }
+    map
+}
+
+fn cosine_sim(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().map(|(k, v)| v * b.get(k).copied().unwrap_or(0.0)).sum();
+    let na = a.values().map(|v| v * v).sum::<f64>().sqrt();
+    let nb = b.values().map(|v| v * v).sum::<f64>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 #[cfg(test)]
@@ -1210,5 +1757,67 @@ mod tests {
             .unwrap();
         let after = s.list_expiring_oauth_credentials(5_000_000, 60_000).unwrap();
         assert!(after.is_empty());
+    }
+
+    #[test]
+    fn memory_retrieval_skills_and_a2a_owner_isolation() {
+        let s = temp_store();
+        s.upsert_memory(&MemoryRow {
+            id: "m1".into(),
+            api_key_hash: "key-a".into(),
+            session_id: "s1".into(),
+            mem_type: "factual".into(),
+            mem_key: "rust-gateway".into(),
+            content: "OmniRoute Rust gateway uses Axum and SQLite WAL for low memory usage".into(),
+            category: "architecture".into(),
+            metadata: serde_json::json!({}),
+            tokens_est: 0,
+            expires_at: None,
+            created_at: 100,
+            updated_at: 100,
+        })
+        .unwrap();
+        let hits = s.retrieve_memories("Axum SQLite low memory", Some("key-a"), None, 200, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.id, "m1");
+        assert!(hits[0].1 > 0.3);
+
+        s.upsert_skill(&SkillRow {
+            id: "sk1".into(),
+            name: "sql-assistant".into(),
+            description: "Helps optimize SQLite queries".into(),
+            source_provider: "local".into(),
+            mode: "on".into(),
+            tags: vec!["sqlite".into(), "sql".into()],
+            instructions: "Analyze query plans and recommend indexes".into(),
+            schema: serde_json::json!({}),
+            enabled: true,
+            executions_count: 0,
+            created_at: 100,
+            updated_at: 100,
+        })
+        .unwrap();
+        assert!(s.record_skill_execution("sql-assistant", 200).unwrap());
+        assert_eq!(s.get_skill("sql-assistant").unwrap().unwrap().executions_count, 1);
+
+        s.upsert_a2a_task(&A2ATaskRow {
+            id: "task-1".into(),
+            owner_hash: "owner-alpha".into(),
+            skill: "health-report".into(),
+            state: "completed".into(),
+            input: serde_json::json!({}),
+            artifacts: vec![serde_json::json!({"type": "text", "content": "ok"})],
+            events: vec![],
+            metadata: serde_json::json!({}),
+            created_at: 100,
+            updated_at: 100,
+            expires_at: 400_000,
+        })
+        .unwrap();
+        assert!(s.get_a2a_task("task-1", "owner-alpha").unwrap().is_some());
+        assert!(
+            s.get_a2a_task("task-1", "owner-beta").unwrap().is_none(),
+            "cross-owner A2A task read must be isolated"
+        );
     }
 }

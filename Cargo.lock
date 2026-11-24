@@ -927,9 +927,21 @@ dependencies = [
 name = "omni-mitm"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
  "omni-types",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

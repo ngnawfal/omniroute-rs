@@ -90,9 +90,10 @@ code {{ color: #79c0ff; }}
 <code>GET  /v1/models</code> &middot; <code>GET /v1/me/status</code> &middot; <code>GET /v1/me/usage</code> &middot; <code>GET /v1/me/quota</code><br>
 <code>GET/POST /api/providers</code> &middot; <code>GET/POST /api/providers/credentials</code> &middot; <code>GET/POST /api/combos</code><br>
 <code>GET/POST /api/keys</code> &middot; <code>GET/PUT /api/settings</code> &middot; <code>GET/PUT /api/settings/compression</code> &middot; <code>GET /api/cache/stats</code><br>
-<code>GET /api/guardrails/status</code> &middot; <code>GET /api/gamification/status</code> &middot; <code>GET /api/mitm/targets</code><br>
+<code>GET /api/guardrails/status</code> &middot; <code>GET /api/gamification/status</code> &middot; <code>GET/POST /api/mitm/status|start|stop|ca.crt</code><br>
+<code>GET /.well-known/agent.json</code> &middot; <code>POST /a2a</code> (A2A v0.3 + v1.0) &middot; <code>/api/memory/*</code> &middot; <code>/api/skills/*</code><br>
 <code>GET /api/oauth/providers</code> &middot; <code>POST /api/oauth/{{provider}}/authorize|callback|poll|import</code> &middot; <code>POST /api/oauth/sweep</code><br>
-<code>POST /api/mcp</code> &mdash; JSON-RPC 2.0 MCP Server (21 tools, also <code>omniroute-rs mcp</code> stdio)
+<code>POST /api/mcp</code> &mdash; JSON-RPC 2.0 MCP Server (24 tools, also <code>omniroute-rs mcp</code> stdio)
 </p>
 
 <h2>Provider Breakers</h2>
