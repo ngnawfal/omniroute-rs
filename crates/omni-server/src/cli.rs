@@ -50,6 +50,10 @@ COMMANDS:
   memory add <KEY> <CONTENT>               Store a new factual memory
   memory search <QUERY>                    Semantic TF-cosine memory retrieval
   skills list                              List installed agent skills
+  db status                                Show SQLite WAL integrity & table counts
+  db import <PATH>                         Import upstream storage.sqlite or db.json
+  db export [FILE] [--include-secrets]     Export portable JSON snapshot
+  db backup [FILE]                         Create hot SQLite backup (VACUUM INTO)
   version                                  Print version & upstream catalog sync metadata
   help                                     Print this help message"#,
         env!("CARGO_PKG_VERSION"),
@@ -424,6 +428,49 @@ pub async fn run_cli(args: &[String], data_dir: &str) -> anyhow::Result<Option<(
                     "{:<24} mode={:<5} source={:<10} runs={} {}",
                     sk.name, sk.mode, sk.source_provider, sk.executions_count, sk.description
                 );
+            }
+            Ok(None)
+        }
+        "db" => {
+            let st = AppState::open(data_dir)?;
+            let action = rest.first().map(|s| s.as_str()).unwrap_or("status");
+            match action {
+                "import" => {
+                    let path = rest
+                        .get(1)
+                        .ok_or_else(|| anyhow::anyhow!("usage: omniroute-rs db import <path>"))?;
+                    let report = if path.ends_with(".json") {
+                        let raw = std::fs::read_to_string(path)?;
+                        let v: serde_json::Value = serde_json::from_str(&raw)?;
+                        st.store.import_upstream_json(&v)?
+                    } else {
+                        st.store.import_upstream_sqlite(path)?
+                    };
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                "export" => {
+                    let include_secrets = has_flag(rest, "--include-secrets");
+                    let snap = st.store.export_snapshot(include_secrets)?;
+                    let out = serde_json::to_string_pretty(&snap)?;
+                    if let Some(dest) = rest.get(1).filter(|s| !s.starts_with("--")) {
+                        std::fs::write(dest, &out)?;
+                        println!("exported snapshot to {dest} ({} bytes)", out.len());
+                    } else {
+                        println!("{out}");
+                    }
+                }
+                "backup" => {
+                    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                    let dest = rest
+                        .get(1)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{data_dir}/backups/omniroute-rs-{ts}.db"));
+                    let bytes = st.store.backup_to_file(&dest)?;
+                    println!("backup written to {dest} ({bytes} bytes)");
+                }
+                _ => {
+                    println!("{}", serde_json::to_string_pretty(&st.store.db_diagnostics()?)?);
+                }
             }
             Ok(None)
         }

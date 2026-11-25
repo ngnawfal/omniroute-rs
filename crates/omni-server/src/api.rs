@@ -747,6 +747,94 @@ pub async fn clear_cache(State(state): State<SharedState>, headers: HeaderMap) -
     json_ok(json!({"ok": true, "cleared_entries": cleared}))
 }
 
+// ── Database Diagnostics, Upstream Import/Export & Hot Backup (/api/db/*) ─
+
+pub async fn db_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    match state.store.db_diagnostics() {
+        Ok(v) => json_ok(v),
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportQuery {
+    pub include_secrets: Option<bool>,
+}
+
+pub async fn db_export(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<ExportQuery>,
+) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    match state.store.export_snapshot(q.include_secrets.unwrap_or(false)) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
+}
+
+pub async fn db_import_json(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    match state.store.import_upstream_json(&body) {
+        Ok(report) => {
+            let _ = state.reload_catalog();
+            json_ok(serde_json::to_value(report).unwrap_or(json!({"ok": true})))
+        }
+        Err(e) => json_status(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportSqliteBody {
+    pub path: String,
+}
+
+pub async fn db_import_upstream_sqlite(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ImportSqliteBody>,
+) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    if body.path.trim().is_empty() {
+        return json_status(StatusCode::BAD_REQUEST, json!({"error": "path is required"}));
+    }
+    match state.store.import_upstream_sqlite(body.path.trim()) {
+        Ok(report) => {
+            let _ = state.reload_catalog();
+            json_ok(serde_json::to_value(report).unwrap_or(json!({"ok": true})))
+        }
+        Err(e) => json_status(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
+    }
+}
+
+pub async fn db_backup(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize_request(&state, &headers, false) {
+        return resp;
+    }
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let dest = format!("{}/backups/omniroute-rs-{ts}.db", state.data_dir);
+    match state.store.backup_to_file(&dest) {
+        Ok(bytes) => json_status(
+            StatusCode::CREATED,
+            json!({"ok": true, "path": dest, "size_bytes": bytes}),
+        ),
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
+}
+
 // ── Self-Service Endpoints (/v1/me/status, /v1/me/usage, /v1/me/quota) ──
 
 pub async fn me_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {

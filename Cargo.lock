@@ -1017,11 +1017,13 @@ name = "omni-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "omni-catalog",
  "rusqlite",
  "serde",
  "serde_json",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

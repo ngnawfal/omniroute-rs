@@ -1,7 +1,11 @@
-// SQLite store: api keys (auth + limits + expiry), provider credentials (multi-account),
-// combos, settings, usage analytics (per-key / time-range / cache tokens), custom providers,
-// gamification state, guardrail audit events, and model aliases.
+// SQLite store: api keys (auth + limits + expiry), provider credentials (multi-account + OAuth),
+// combos, settings, usage analytics, custom providers, gamification state, guardrail audit events,
+// model aliases, memories, skills, A2A tasks, call_logs, domain_budgets, key_templates,
+// plus direct upstream Node.js `storage.sqlite` & `db.json` import/export bridge.
 // Single-file DB at data/omniroute-rs.db, WAL journaling.
+
+pub mod upstream_compat;
+pub use upstream_compat::ImportReport;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -145,6 +149,39 @@ const BASE_MIGRATIONS: &[&str] = &[
         expires_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS a2a_tasks_owner_idx ON a2a_tasks(owner_hash, created_at);",
+    // 13 — call_logs (upstream parity table)
+    "CREATE TABLE IF NOT EXISTS call_logs (
+        id TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        method TEXT,
+        path TEXT,
+        status INTEGER,
+        model TEXT,
+        provider TEXT,
+        connection_id TEXT,
+        duration INTEGER DEFAULT 0,
+        tokens_in INTEGER DEFAULT 0,
+        tokens_out INTEGER DEFAULT 0,
+        error_summary TEXT
+    );
+    CREATE INDEX IF NOT EXISTS call_logs_ts_idx ON call_logs(timestamp);",
+    // 14 — domain_budgets (upstream parity table)
+    "CREATE TABLE IF NOT EXISTS domain_budgets (
+        api_key_id TEXT PRIMARY KEY,
+        daily_limit_usd REAL NOT NULL DEFAULT 0,
+        weekly_limit_usd REAL DEFAULT 0,
+        monthly_limit_usd REAL DEFAULT 0,
+        warning_threshold REAL DEFAULT 0.8
+    );",
+    // 15 — key_templates (upstream parity table)
+    "CREATE TABLE IF NOT EXISTS key_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL DEFAULT '',
+        policy TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1819,5 +1856,86 @@ mod tests {
             s.get_a2a_task("task-1", "owner-beta").unwrap().is_none(),
             "cross-owner A2A task read must be isolated"
         );
+    }
+
+    #[test]
+    fn upstream_storage_sqlite_import_json_export_and_hot_backup() {
+        // 1. Build a genuine upstream Node.js OmniRoute `storage.sqlite` fixture
+        let tmp = format!(
+            "{}/omni-upstream-src-{}-{}.sqlite",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let up = Connection::open(&tmp).unwrap();
+            up.execute_batch(
+                "CREATE TABLE _omniroute_migrations (id TEXT PRIMARY KEY);
+                 INSERT INTO _omniroute_migrations VALUES ('001_initial'), ('253_v3855');
+                 CREATE TABLE provider_connections (
+                     id TEXT PRIMARY KEY, provider TEXT NOT NULL, auth_type TEXT, name TEXT,
+                     priority INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1,
+                     api_key TEXT, access_token TEXT, refresh_token TEXT,
+                     expires_at TEXT, provider_specific_data TEXT, health_check_interval INTEGER
+                 );
+                 INSERT INTO provider_connections VALUES (
+                     'conn-up-1', 'claude', 'oauth', 'Claude Pro', 5, 1,
+                     NULL, 'sk-ant-oat-up', 'rt-up-1', '2027-01-01T00:00:00Z', '{\"plan\":\"pro\"}', 30
+                 );
+                 CREATE TABLE combos (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
+                 INSERT INTO combos VALUES (
+                     'cmb-1', 'smart-fast',
+                     '{\"strategy\":\"jev\",\"models\":[\"groq/openai/gpt-oss-120b\",{\"provider\":\"pollinations\",\"model\":\"openai-fast\",\"weight\":2}]}'
+                 );
+                 CREATE TABLE api_keys (id TEXT PRIMARY KEY, name TEXT NOT NULL, key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+                 INSERT INTO api_keys VALUES ('k1', 'prod', 'sk-from-upstream', '2026-11-01T00:00:00Z');
+                 CREATE TABLE key_value (namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (namespace, key));
+                 INSERT INTO key_value VALUES ('settings', 'default_strategy', '\"expiry-first\"');
+                 INSERT INTO key_value VALUES ('modelAliases', 'fast', '\"smart-fast\"');
+                 CREATE TABLE usage_history (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, model TEXT, connection_id TEXT,
+                     tokens_input INTEGER, tokens_output INTEGER, tokens_cache_read INTEGER,
+                     tokens_cache_creation INTEGER, latency_ms INTEGER, success INTEGER, timestamp TEXT NOT NULL
+                 );
+                 INSERT INTO usage_history(provider, model, connection_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, latency_ms, success, timestamp)
+                 VALUES ('claude', 'claude-opus-4-7', 'conn-up-1', 120, 40, 20, 0, 450, 1, '2026-11-24T10:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        // 2. Import into omniroute-rs Store
+        let s = temp_store();
+        let rep = s.import_upstream_sqlite(&tmp).unwrap();
+        assert_eq!(rep.upstream_migrations_detected, 2);
+        assert_eq!(rep.provider_connections, 1);
+        assert_eq!(rep.combos, 1);
+        assert_eq!(rep.api_keys, 1);
+        assert_eq!(rep.settings, 1);
+        assert_eq!(rep.aliases, 1);
+        assert_eq!(rep.usage_rows, 1);
+
+        let cred = s.get_credential("claude", "conn-up-1").unwrap().unwrap();
+        assert_eq!(cred.api_key, "sk-ant-oat-up");
+        assert_eq!(cred.refresh_token.as_deref(), Some("rt-up-1"));
+        assert_eq!(cred.health_check_interval_min, 30);
+        assert_eq!(s.resolve_model_alias("fast").unwrap().as_deref(), Some("smart-fast"));
+        assert_eq!(s.get_setting("default_strategy").unwrap().as_deref(), Some("expiry-first"));
+
+        // 3. Export snapshot -> restore into a brand new Store -> verify roundtrip
+        let snap = s.export_snapshot(true).unwrap();
+        let s2 = temp_store();
+        let rep2 = s2.import_upstream_json(&snap).unwrap();
+        assert_eq!(rep2.provider_connections, 1);
+        assert_eq!(rep2.combos, 1);
+        assert_eq!(rep2.api_keys, 1);
+
+        // 4. Diagnostics + hot VACUUM INTO backup
+        let diag = s2.db_diagnostics().unwrap();
+        assert_eq!(diag["ok"], true);
+        let bak_path = format!("{tmp}.bak");
+        let bak_size = s2.backup_to_file(&bak_path).unwrap();
+        assert!(bak_size > 4096);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak_path);
     }
 }

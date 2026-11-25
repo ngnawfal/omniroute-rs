@@ -145,9 +145,16 @@ pub fn build_router(app_state: SharedState) -> Router {
             post(oauth_api::manual_refresh_oauth),
         )
         .route("/api/mcp", post(api::mcp_http))
-        // Liveness & status HTML
+        // Database Diagnostics, Upstream Import/Export & Hot Backup
+        .route("/api/db/status", get(api::db_status))
+        .route("/api/db/export", get(api::db_export))
+        .route("/api/db/import/json", post(api::db_import_json))
+        .route("/api/db/import/upstream-sqlite", post(api::db_import_upstream_sqlite))
+        .route("/api/db/backup", post(api::db_backup))
+        // Liveness & Embedded Interactive Web Dashboard SPA
         .route("/healthz", get(|| async { "ok" }))
         .route("/", get(status::status_page))
+        .route("/dashboard", get(status::status_page))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(app_state)
@@ -1275,5 +1282,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped["running"], false);
+    }
+
+    #[tokio::test]
+    async fn phase6_dashboard_and_upstream_db_import_export_backup_e2e() {
+        let (base, _st) = spawn_test_server().await;
+        let client = reqwest::Client::new();
+
+        // 1. Embedded Interactive Web Dashboard served at both / and /dashboard
+        for path in ["/", "/dashboard"] {
+            let html = client
+                .get(format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(html.contains("Native Rust AI Gateway Dashboard"));
+            assert!(html.contains("tab-database"));
+            assert!(html.contains("Live Chat Playground"));
+        }
+
+        // 2. Database status & 15-table diagnostics
+        let db_st: Value = client
+            .get(format!("{base}/api/db/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(db_st["ok"], true);
+        assert_eq!(db_st["applied_migrations"], 15);
+        assert!(db_st["table_counts"]["call_logs"].is_number());
+        assert!(db_st["table_counts"]["domain_budgets"].is_number());
+
+        // 3. Import legacy upstream db.json shape
+        let imp: Value = client
+            .post(format!("{base}/api/db/import/json"))
+            .json(&json!({
+                "providerConnections": [{
+                    "id": "up-conn-1",
+                    "provider": "openai",
+                    "authType": "apikey",
+                    "apiKey": "sk-up-secret-999",
+                    "name": "Migrated OpenAI"
+                }],
+                "combos": [{
+                    "id": "c-up-1",
+                    "name": "migrated-combo",
+                    "strategy": "jev",
+                    "models": ["openai/gpt-6.1-sol"]
+                }],
+                "modelAliases": {"default-fast": "migrated-combo"}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(imp["provider_connections"], 1);
+        assert_eq!(imp["combos"], 1);
+        assert_eq!(imp["aliases"], 1);
+
+        // 4. Export snapshot (redacted by default, secrets when opted in)
+        let exp_redacted: Value = client
+            .get(format!("{base}/api/db/export"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(exp_redacted["providerConnections"][0]["api_key"], "[REDACTED]");
+
+        let exp_full: Value = client
+            .get(format!("{base}/api/db/export?include_secrets=true"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(exp_full["providerConnections"][0]["api_key"], "sk-up-secret-999");
+
+        // 5. Hot SQLite backup via VACUUM INTO
+        let bak = client
+            .post(format!("{base}/api/db/backup"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bak.status(), 201);
+        let bak_json: Value = bak.json().await.unwrap();
+        assert_eq!(bak_json["ok"], true);
+        assert!(bak_json["size_bytes"].as_u64().unwrap() > 4096);
     }
 }

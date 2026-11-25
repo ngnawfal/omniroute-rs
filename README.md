@@ -24,6 +24,9 @@ cargo run --release -p omni-server
 ./target/release/omniroute-rs keys create --label dev --rpm 120
 ./target/release/omniroute-rs oauth list
 ./target/release/omniroute-rs memory add stack "Rust Axum + SQLite WAL"
+./target/release/omniroute-rs db status
+./target/release/omniroute-rs db import /path/to/storage.sqlite
+./target/release/omniroute-rs db backup
 ./target/release/omniroute-rs version
 ```
 
@@ -57,7 +60,7 @@ cargo build --release
 ### Management API & Observability (`/api/*`)
 | Route | Fungsi |
 |---|---|
-| `GET /healthz`, `GET /api/health`, `GET /` | Liveness, telemetri JSON lengkap, dan status page HTML |
+| `GET /healthz`, `GET /api/health`, `GET /`, `GET /dashboard` | Liveness, telemetri JSON, dan **Embedded Interactive Web Dashboard SPA** (8 tab, 0 aset eksternal) |
 | `GET/POST /api/providers`, `GET/DELETE /api/providers/{id}` | Daftar 394 provider + CRUD custom provider |
 | `GET/POST /api/providers/credentials` & `DELETE` | Multi-account credential management |
 | `GET/POST /api/combos`, `GET/DELETE /api/combos/{id}`, `POST /api/combos/simulate` | Combo CRUD (22 strategi v3.8.55 + auto-combo) & dry-run |
@@ -73,6 +76,7 @@ cargo build --release
 | `GET/POST /api/memory`, `POST /api/memory/retrieve`, `GET/POST /api/skills`, `POST /api/skills/{id}/execute` | Persistent Agent Memory (TF-cosine retrieval) & Skills Registry |
 | `GET /api/oauth/providers`, `POST /api/oauth/{provider}/authorize\|callback\|poll\|import` | OAuth 2.0 PKCE & Device-Code (17 provider) + token import |
 | `POST /api/oauth/{provider}/{connection_id}/refresh` & `POST /api/oauth/sweep` | Manual refresh & background sweep (`BG_REFRESH_GOOGLE_DELAY_MS`, `TOKEN_REFRESH_RETRY_JITTER`, `HEALTHCHECK_PER_PROVIDER_CONCURRENCY`) |
+| `GET /api/db/status`, `GET /api/db/export`, `POST /api/db/import/json\|upstream-sqlite`, `POST /api/db/backup` | Diagnostik SQLite WAL, migrasi langsung dari `storage.sqlite` / `db.json` Node.js upstream, export snapshot & hot backup |
 | `POST /api/mcp` | JSON-RPC 2.0 MCP Server over HTTP (**24 tools aktif**) |
 
 ## Arsitektur Workspace (14 Crates)
@@ -87,16 +91,16 @@ cargo build --release
 | `omni-oauth` | OAuth 2.0 PKCE (`S256`), RFC 8628 Device-Code, GitHub Copilot token exchange, Google refresh slot spacing, SHA-256 retry jitter, refresh breaker, AWS region SSRF guard |
 | `omni-router` | 22 strategi publik `v3.8.55` (`expiry-first`, `jev`, dll.) + `quota-share` + 11 auto-strategy (`decision`, dll.) |
 | `omni-exec` | HTTP dispatcher + gzip body Anthropic `>= 4096B` + 415 fallback latch + 7 executor prioritas (Claude, Codex/ChatGPT, Copilot, Antigravity/Gemini CLI, AWS Bedrock SigV4+Converse, GCP Vertex, Azure Foundry/Classic) |
-| `omni-store` | SQLite WAL (**12 tabel persisten**: API keys, credentials+OAuth, usage, custom providers, combos, settings, gamification, guardrails, aliases, **memories**, **skills**, **a2a_tasks**) |
+| `omni-store` | SQLite WAL (**15 tabel persisten** + importer langsung `storage.sqlite` / `db.json` upstream, snapshot export & `VACUUM INTO` hot backup) |
 | `omni-guard` | Prompt injection (precompiled regex), PII masker, reversible `PiiVault`, `agent-guard` (`monitor`/`block`) |
 | `omni-gami` | XP, kurva level, tier, streak harian, badge evaluation |
 | `omni-mcp` | JSON-RPC 2.0 MCP Server (stdio & HTTP) dengan **24 tools** aktif |
 | `omni-mitm` | Live TCP/TLS HTTP CONNECT MITM proxy + pure-Rust ECDSA P-256 Root CA & dynamic leaf cert + 10-agent targets registry |
-| `omni-server` | Binary `omniroute-rs` (Axum + A2A v0.3/v1.0 + Memory/Skills + OAuth scheduler + full CLI subcommands + semua 13 library crate) |
+| `omni-server` | Binary tunggal `omniroute-rs` (Axum + Embedded Web Dashboard + A2A v0.3/v1.0 + Memory/Skills + OAuth scheduler + full CLI + semua 13 library crate) |
 
-## Cakupan Fase Lanjutan
+## Status Migrasi (Fase 1–6 Selesai)
 
-- **Fase 6:** Kompatibilitas penuh 253 migrasi DB upstream & embedded Web Dashboard.
+Seluruh 6 fase migrasi terhadap upstream OmniRoute **`release/v3.8.55`** telah selesai diimplementasikan dan terverifikasi dalam satu binari native Rust tanpa Node.js/Electron.
 
 ## Build & Test
 

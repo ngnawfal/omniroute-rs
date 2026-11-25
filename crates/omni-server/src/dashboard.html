@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omniroute-rs — Native Rust AI Gateway Dashboard</title>
+<style>
+:root {
+  --bg: #0b0f14;
+  --surface: #121821;
+  --surface2: #18212d;
+  --border: #263244;
+  --text: #e6edf3;
+  --muted: #8b99ad;
+  --accent: #38bdf8;
+  --accent2: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+header {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 20px; background: rgba(11,15,20,0.92); backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.02em; color: var(--text); }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+  border-radius: 999px; font-size: 11px; font-family: var(--mono);
+  background: var(--surface2); border: 1px solid var(--border); color: var(--accent);
+}
+.pill.ok { color: var(--accent2); border-color: rgba(34,197,94,0.35); }
+.pill.warn { color: var(--warn); border-color: rgba(245,158,11,0.35); }
+.pill.err { color: var(--danger); border-color: rgba(239,68,68,0.35); }
+.auth-bar { display: flex; align-items: center; gap: 8px; }
+input, select, textarea {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 10px; font-size: 13px; font-family: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+button {
+  background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 12px; font-size: 13px; font-weight: 500; cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+button:hover { border-color: var(--accent); background: #1e2a3a; }
+button.primary { background: #0284c7; border-color: #0ea5e9; color: #fff; }
+button.primary:hover { background: #0369a1; }
+button.danger { background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.45); color: #fca5a5; }
+button.sm { padding: 4px 8px; font-size: 12px; }
+nav {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 10px 20px 0;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+}
+nav button {
+  border: none; border-bottom: 2px solid transparent; border-radius: 6px 6px 0 0;
+  background: transparent; color: var(--muted); padding: 9px 14px; font-weight: 600;
+}
+nav button.active { color: var(--accent); border-bottom-color: var(--accent); background: var(--bg); }
+main { max-width: 1280px; margin: 0 auto; padding: 20px; }
+.panel { display: none; }
+.panel.active { display: block; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+}
+.card h2 { margin: 0 0 10px; font-size: 14px; font-weight: 600; color: var(--text); display: flex; align-items: center; justify-content: space-between; }
+.kpi-val { font-size: 22px; font-weight: 700; font-family: var(--mono); color: var(--accent2); }
+.kpi-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+code, pre { font-family: var(--mono); font-size: 12px; }
+pre {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; overflow: auto; max-height: 320px; margin: 10px 0 0; white-space: pre-wrap; word-break: break-word;
+}
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.grow { flex: 1 1 180px; }
+.muted { color: var(--muted); font-size: 12px; }
+.toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 50;
+  background: var(--surface2); border: 1px solid var(--accent); color: var(--text);
+  padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none; max-width: 420px;
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>omniroute-rs</h1>
+    <span class="pill ok" id="hdr-status">connecting...</span>
+    <span class="pill" id="hdr-ver">v3.8.55</span>
+    <span class="pill" id="hdr-uptime">0s</span>
+  </div>
+  <div class="auth-bar">
+    <input id="api-key-input" type="password" placeholder="Gateway API Key (optional)" style="width:220px">
+    <button class="sm" onclick="saveApiKey()">Save Key</button>
+    <button class="sm primary" onclick="refreshAll()">Refresh</button>
+  </div>
+</header>
+
+<nav id="tabs">
+  <button class="active" data-tab="overview">Overview &amp; Playground</button>
+  <button data-tab="providers">Providers &amp; OAuth</button>
+  <button data-tab="combos">Combos &amp; Routing</button>
+  <button data-tab="security">Keys &amp; Guardrails</button>
+  <button data-tab="opt">Compression &amp; Cache</button>
+  <button data-tab="mitm">MITM &amp; A2A</button>
+  <button data-tab="memory">Memory &amp; Skills</button>
+  <button data-tab="database">Database &amp; Migration</button>
+</nav>
+
+<main>
+  <!-- 1. OVERVIEW & PLAYGROUND -->
+  <section id="tab-overview" class="panel active">
+    <div class="kpi-grid">
+      <div class="card"><div class="kpi-val" id="kpi-prov">-</div><div class="kpi-label" id="kpi-models">Providers / Models</div></div>
+      <div class="card"><div class="kpi-val" id="kpi-reqs">-</div><div class="kpi-label" id="kpi-toks">Requests / Tokens</div></div>
+      <div class="card"><div class="kpi-val" id="kpi-creds">-</div><div class="kpi-label">Credentials / Combos</div></div>
+      <div class="card"><div class="kpi-val" id="kpi-cache">-</div><div class="kpi-label" id="kpi-comp">Cache Hit / RTK Saved</div></div>
+      <div class="card"><div class="kpi-val" id="kpi-gami">-</div><div class="kpi-label" id="kpi-streak">Gamification Level &amp; XP</div></div>
+      <div class="card"><div class="kpi-val" id="kpi-mitm">-</div><div class="kpi-label">MITM Proxy / Lockouts</div></div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <h2>Live Chat Playground (<code>POST /v1/chat/completions</code>)</h2>
+        <div class="row">
+          <input id="pg-model" class="grow" value="pollinations/openai-fast" placeholder="provider/model or combo">
+          <button class="primary" onclick="runPlayground()">Send</button>
+        </div>
+        <textarea id="pg-prompt" rows="3" style="width:100%" placeholder="Prompt to test routing, guardrails, compression &amp; cache...">Explain Rust ownership in one short sentence.</textarea>
+        <pre id="pg-out">Ready. Click Send to invoke the gateway live.</pre>
+      </div>
+      <div class="card">
+        <h2>Circuit Breakers &amp; Active Lockouts</h2>
+        <table>
+          <thead><tr><th>Provider</th><th>State</th><th>Streak</th></tr></thead>
+          <tbody id="tbl-breakers"><tr><td colspan="3" class="muted">Loading...</td></tr></tbody>
+        </table>
+        <pre id="out-lockouts" style="max-height:140px">No active lockouts.</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. PROVIDERS & OAUTH -->
+  <section id="tab-providers" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>Add Provider Credential</h2>
+        <div class="row">
+          <input id="cr-prov" placeholder="provider (e.g. openai, claude, bedrock)" class="grow">
+          <input id="cr-cid" placeholder="connection_id" value="default" style="width:130px">
+        </div>
+        <div class="row">
+          <input id="cr-key" type="password" placeholder="API Key / Access Token" class="grow">
+          <select id="cr-auth">
+            <option value="bearer">bearer</option>
+            <option value="x-api-key">x-api-key</option>
+            <option value="oauth">oauth</option>
+            <option value="api-key">api-key (Azure)</option>
+            <option value="x-goog-api-key">x-goog-api-key</option>
+          </select>
+        </div>
+        <div class="row">
+          <input id="cr-label" placeholder="Label (optional)" class="grow">
+          <button class="primary" onclick="addCredential()">Save Credential</button>
+        </div>
+        <table>
+          <thead><tr><th>Provider</th><th>Conn</th><th>Auth</th><th>Health</th><th></th></tr></thead>
+          <tbody id="tbl-creds"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>OAuth 2.0 PKCE / Device-Code Manager <button class="sm" onclick="triggerOAuthSweep()">Run Sweep</button></h2>
+        <div class="row">
+          <select id="oa-prov" class="grow"></select>
+          <button class="primary" onclick="startOAuth()">Start Auth</button>
+        </div>
+        <pre id="oa-out">Select any of the 17 OAuth providers to generate a PKCE URL or start Device-Code login.</pre>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Embedded Provider Catalog (<span id="cat-count">394</span> providers)</h2>
+      <div class="row">
+        <input id="prov-q" class="grow" placeholder="Search provider id / name..." oninput="loadProviders()">
+        <label class="muted"><input type="checkbox" id="prov-free" onchange="loadProviders()"> Free-tier only</label>
+      </div>
+      <div style="max-height:360px;overflow:auto">
+        <table>
+          <thead><tr><th>ID</th><th>Format</th><th>Auth</th><th>Models</th><th>Free</th><th>Accounts</th></tr></thead>
+          <tbody id="tbl-providers"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. COMBOS & ROUTING -->
+  <section id="tab-combos" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>Create Routing Combo (22 v3.8.55 Strategies)</h2>
+        <div class="row">
+          <input id="cb-name" placeholder="Combo name (e.g. fast-coding)" class="grow">
+          <select id="cb-strat"></select>
+        </div>
+        <textarea id="cb-models" rows="3" style="width:100%" placeholder='[{"provider":"groq","model":"openai/gpt-oss-120b","weight":2},{"provider":"pollinations","model":"openai-fast","weight":1}]'>[{"provider":"groq","model":"openai/gpt-oss-120b","weight":2},{"provider":"pollinations","model":"openai-fast","weight":1}]</textarea>
+        <div class="row" style="margin-top:8px"><button class="primary" onclick="createCombo()">Save Combo</button></div>
+        <table>
+          <thead><tr><th>Name</th><th>Strategy</th><th>Steps</th><th></th></tr></thead>
+          <tbody id="tbl-combos"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Route Simulator (<code>POST /api/combos/simulate</code>)</h2>
+        <div class="row">
+          <input id="sim-model" class="grow" value="openai/gpt-6.1-sol" placeholder="model or combo name">
+          <select id="sim-strat"><option value="">(default)</option></select>
+          <button class="primary" onclick="simulateRoute()">Simulate</button>
+        </div>
+        <pre id="sim-out">Dry-run candidate ordering without calling upstream.</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. API KEYS & GUARDRAILS -->
+  <section id="tab-security" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>Gateway API Keys</h2>
+        <div class="row">
+          <input id="key-label" placeholder="Label" class="grow">
+          <input id="key-rpm" type="number" placeholder="RPM" style="width:90px">
+          <button class="primary" onclick="createApiKey()">Generate Key</button>
+        </div>
+        <pre id="key-created" style="display:none"></pre>
+        <table>
+          <thead><tr><th>Key</th><th>Label</th><th>RPM</th><th></th></tr></thead>
+          <tbody id="tbl-keys"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Guardrails &amp; Agent-Guard</h2>
+        <div class="row">
+          <input id="gr-name" placeholder="Pattern name" style="width:140px">
+          <input id="gr-regex" placeholder="Regex pattern" class="grow">
+          <button class="primary" onclick="addGuardPattern()">Add Pattern</button>
+        </div>
+        <pre id="gr-out">Loading guardrails status...</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5. COMPRESSION & SEMANTIC CACHE -->
+  <section id="tab-opt" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>RTK + Caveman Compression</h2>
+        <div class="row">
+          <label><input type="checkbox" id="cp-en"> Enabled</label>
+          <select id="cp-rtk"><option value="off">RTK: off</option><option value="light">RTK: light</option><option value="standard" selected>RTK: standard</option><option value="aggressive">RTK: aggressive</option></select>
+          <select id="cp-cav"><option value="off">Caveman: off</option><option value="lite">Caveman: lite</option><option value="full">Caveman: full</option><option value="ultra">Caveman: ultra</option></select>
+          <button class="primary" onclick="saveCompression()">Apply</button>
+        </div>
+        <pre id="cp-out">Loading...</pre>
+      </div>
+      <div class="card">
+        <h2>Dual-Layer Semantic Cache <button class="sm danger" onclick="clearCache()">Clear Cache</button></h2>
+        <div class="row">
+          <label><input type="checkbox" id="sc-en"> Enabled</label>
+          <input id="sc-sim" type="number" step="0.05" min="0.1" max="1" value="0.82" style="width:85px" title="Cosine similarity threshold">
+          <label><input type="checkbox" id="sc-zero"> Temp=0 only</label>
+          <button class="primary" onclick="saveCache()">Apply</button>
+        </div>
+        <pre id="sc-out">Loading...</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. MITM PROXY & A2A -->
+  <section id="tab-mitm" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>Live TCP/TLS HTTP CONNECT MITM Proxy</h2>
+        <div class="row">
+          <input id="mt-port" type="number" value="20443" style="width:100px">
+          <button class="primary" onclick="startMitm()">Start Proxy</button>
+          <button class="danger" onclick="stopMitm()">Stop</button>
+          <button onclick="rotateMitmCa()">Rotate CA</button>
+          <a href="/api/mitm/ca.crt" download="omniroute-mitm-ca.crt"><button type="button">Download CA .crt</button></a>
+        </div>
+        <pre id="mt-out">Loading MITM status...</pre>
+      </div>
+      <div class="card">
+        <h2>A2A v0.3 (+ v1.0 Compat) Runner</h2>
+        <div class="row">
+          <select id="a2a-skill" class="grow">
+            <option value="health-report">health-report</option>
+            <option value="smart-routing">smart-routing</option>
+            <option value="cost-analysis">cost-analysis</option>
+            <option value="quota-management">quota-management</option>
+            <option value="provider-discovery">provider-discovery</option>
+            <option value="list-capabilities">list-capabilities</option>
+          </select>
+          <button class="primary" onclick="runA2A()">Invoke /a2a</button>
+          <a href="/.well-known/agent.json" target="_blank"><button type="button">Agent Card</button></a>
+        </div>
+        <input id="a2a-msg" style="width:100%" value="Generate a full gateway status report">
+        <pre id="a2a-out">Click Invoke /a2a to test JSON-RPC 2.0 A2A execution.</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. MEMORY & SKILLS -->
+  <section id="tab-memory" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>Persistent Agent Memory (SQLite WAL + TF-Cosine)</h2>
+        <div class="row">
+          <input id="mem-key" placeholder="key" style="width:140px">
+          <input id="mem-content" placeholder="Memory content..." class="grow">
+          <button class="primary" onclick="addMemory()">Store</button>
+        </div>
+        <div class="row">
+          <input id="mem-q" placeholder="Semantic retrieval query..." class="grow">
+          <button onclick="searchMemory()">Retrieve</button>
+        </div>
+        <pre id="mem-out">Loading memories...</pre>
+      </div>
+      <div class="card">
+        <h2>Installed Skills Registry</h2>
+        <div class="row">
+          <input id="sk-name" placeholder="skill name" style="width:140px">
+          <input id="sk-desc" placeholder="description" class="grow">
+          <button class="primary" onclick="addSkill()">Install</button>
+        </div>
+        <input id="sk-inst" style="width:100%;margin-bottom:8px" placeholder="Skill instructions / prompt template">
+        <pre id="sk-out">Loading skills...</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8. DATABASE & MIGRATION -->
+  <section id="tab-database" class="panel">
+    <div class="two-col">
+      <div class="card">
+        <h2>SQLite WAL Health &amp; Hot Backup</h2>
+        <div class="row">
+          <button class="primary" onclick="runDbBackup()">Create Hot Backup</button>
+          <a href="/api/db/export" download="omniroute-rs-snapshot.json"><button type="button">Export JSON Snapshot</button></a>
+        </div>
+        <pre id="db-out">Loading database diagnostics...</pre>
+      </div>
+      <div class="card">
+        <h2>Migrate Upstream Node.js <code>storage.sqlite</code></h2>
+        <div class="row">
+          <input id="db-path" class="grow" placeholder="Absolute path to upstream storage.sqlite">
+          <button class="primary" onclick="importUpstreamSqlite()">Import SQLite</button>
+        </div>
+        <p class="muted">Reads upstream <code>provider_connections</code>, <code>provider_nodes</code>, <code>combos</code>, <code>api_keys</code>, <code>key_value</code>, and <code>usage_history</code> non-destructively.</p>
+        <pre id="db-imp-out">Ready.</pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function getKey() { return localStorage.getItem('omniroute_api_key') || ''; }
+function saveApiKey() {
+  localStorage.setItem('omniroute_api_key', $('api-key-input').value.trim());
+  toast('API key saved in browser localStorage');
+  refreshAll();
+}
+function authHeaders(extra = {}) {
+  const h = { ...extra };
+  const k = getKey();
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return h;
+}
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: authHeaders(opts.headers || {}) });
+  const text = await res.text();
+  try { return { ok: res.ok, status: res.status, headers: res.headers, data: JSON.parse(text) }; }
+  catch { return { ok: res.ok, status: res.status, headers: res.headers, data: text }; }
+}
+function toast(msg) {
+  const el = $('toast'); el.textContent = msg; el.style.display = 'block';
+  clearTimeout(window._tt); window._tt = setTimeout(() => el.style.display = 'none', 3200);
+}
+
+document.querySelectorAll('#tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+async function refreshAll() {
+  const [h, g, m, gr, db, mem, sk, oa, keys, creds, combos] = await Promise.all([
+    api('/api/health'), api('/api/gamification/status'), api('/api/mitm/status'),
+    api('/api/guardrails/status'), api('/api/db/status'), api('/api/memory'),
+    api('/api/skills'), api('/api/oauth/providers'), api('/api/keys'),
+    api('/api/providers/credentials'), api('/api/combos')
+  ]);
+  if (h.ok) {
+    const d = h.data;
+    $('hdr-status').textContent = 'ONLINE';
+    $('hdr-ver').textContent = 'upstream v' + d.upstream_sync_version;
+    $('hdr-uptime').textContent = d.uptime_secs + 's';
+    $('kpi-prov').textContent = d.provider_count;
+    $('kpi-models').textContent = d.model_count + ' models (' + d.routing_strategies + ' strategies)';
+    $('kpi-reqs').textContent = d.usage?.requests ?? 0;
+    $('kpi-toks').textContent = (d.usage?.total_tokens ?? 0) + ' tokens';
+    $('kpi-creds').textContent = d.configured_credentials + ' / ' + d.combos_count;
+    $('kpi-cache').textContent = (d.cache?.stats?.hit_rate ?? 0).toFixed(1) + '%';
+    $('kpi-comp').textContent = (d.compression?.stats?.total_tokens_saved ?? 0) + ' tok saved';
+    const bRows = (d.breakers || []).map(b => `<tr><td>${b.provider}</td><td>${b.state}</td><td>${b.failure_streak}</td></tr>`).join('');
+    $('tbl-breakers').innerHTML = bRows || '<tr><td colspan="3" class="muted">All providers healthy (CLOSED)</td></tr>';
+    $('out-lockouts').textContent = (d.active_lockouts || []).length ? JSON.stringify(d.active_lockouts, null, 2) : 'No active lockouts.';
+    $('cp-en').checked = !!d.compression?.config?.enabled;
+    $('cp-rtk').value = d.compression?.config?.rtk_intensity || 'standard';
+    $('cp-cav').value = d.compression?.config?.caveman_intensity || 'off';
+    $('cp-out').textContent = JSON.stringify(d.compression, null, 2);
+    $('sc-en').checked = !!d.cache?.config?.enabled;
+    $('sc-sim').value = d.cache?.config?.similarity_threshold ?? 0.82;
+    $('sc-zero').checked = !!d.cache?.config?.require_zero_temperature;
+    $('sc-out').textContent = JSON.stringify(d.cache, null, 2);
+    $('kpi-mitm').textContent = (m.data?.running ? 'RUNNING' : 'IDLE') + ' / ' + (d.active_lockouts?.length ?? 0);
+  }
+  if (g.ok) {
+    $('kpi-gami').textContent = 'Lv.' + g.data.level + ' (' + g.data.total_xp + ' XP)';
+    $('kpi-streak').textContent = 'Tier: ' + g.data.tier + ' | Streak: ' + g.data.current_streak + 'd';
+  }
+  if (m.ok) $('mt-out').textContent = JSON.stringify(m.data, null, 2);
+  if (gr.ok) $('gr-out').textContent = JSON.stringify(gr.data, null, 2);
+  if (db.ok) $('db-out').textContent = JSON.stringify(db.data, null, 2);
+  if (mem.ok) $('mem-out').textContent = JSON.stringify(mem.data, null, 2);
+  if (sk.ok) $('sk-out').textContent = JSON.stringify(sk.data, null, 2);
+  if (oa.ok) {
+    $('oa-prov').innerHTML = (oa.data.providers || []).map(p => `<option value="${p.id}">${p.id} (${p.flow})</option>`).join('');
+  }
+  if (creds.ok) {
+    $('tbl-creds').innerHTML = (creds.data.credentials || []).map(c =>
+      `<tr><td>${c.provider}</td><td>${c.connection_id}</td><td>${c.auth_type}</td><td>${c.health_status}</td><td><button class="sm danger" onclick="delCred('${c.provider}','${c.connection_id}')">Del</button></td></tr>`
+    ).join('') || '<tr><td colspan="5" class="muted">No credentials saved</td></tr>';
+  }
+  if (keys.ok) {
+    $('tbl-keys').innerHTML = (keys.data.keys || []).map(k =>
+      `<tr><td><code>${k.key_preview}</code></td><td>${k.label}</td><td>${k.rpm_limit ?? '-'}</td><td class="muted">${k.disabled ? 'disabled' : 'active'}</td></tr>`
+    ).join('') || '<tr><td colspan="4" class="muted">Open-door mode (no API keys configured)</td></tr>';
+  }
+  if (combos.ok) {
+    const strats = combos.data.strategies || [];
+    $('cb-strat').innerHTML = strats.map(s => `<option value="${s}">${s}</option>`).join('');
+    $('sim-strat').innerHTML = '<option value="">(default)</option>' + strats.map(s => `<option value="${s}">${s}</option>`).join('');
+    $('tbl-combos').innerHTML = (combos.data.combos || []).map(c =>
+      `<tr><td>${c.name}</td><td><code>${c.strategy}</code></td><td>${c.models.length}</td><td><button class="sm danger" onclick="delCombo('${c.id}')">Del</button></td></tr>`
+    ).join('') || '<tr><td colspan="4" class="muted">No combos configured</td></tr>';
+  }
+  loadProviders();
+}
+
+async function loadProviders() {
+  const q = encodeURIComponent($('prov-q').value.trim());
+  const free = $('prov-free').checked ? 'true' : 'false';
+  const r = await api(`/api/providers?q=${q}&free_only=${free}&limit=120`);
+  if (!r.ok) return;
+  $('cat-count').textContent = r.data.total;
+  $('tbl-providers').innerHTML = (r.data.providers || []).map(p =>
+    `<tr><td><code>${p.id}</code></td><td>${p.format}</td><td>${p.auth_type}</td><td>${p.model_count}</td><td>${p.is_free_tier ? 'yes' : ''}</td><td>${p.configured_accounts}</td></tr>`
+  ).join('');
+}
+
+async function runPlayground() {
+  $('pg-out').textContent = 'Dispatching...';
+  const t0 = performance.now();
+  const r = await api('/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: $('pg-model').value.trim(), messages: [{ role: 'user', content: $('pg-prompt').value }] })
+  });
+  const ms = Math.round(performance.now() - t0);
+  $('pg-out').textContent = `HTTP ${r.status} (${ms} ms) | Provider: ${r.headers.get('x-omniroute-provider') || '-'} | Cache: ${r.headers.get('x-omniroute-cache') || '-'}\n\n` + JSON.stringify(r.data, null, 2);
+}
+async function addCredential() {
+  const r = await api('/api/providers/credentials', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: $('cr-prov').value.trim(), connection_id: $('cr-cid').value.trim() || 'default', auth_type: $('cr-auth').value, api_key: $('cr-key').value, base_urls: [], models: [], label: $('cr-label').value.trim() })
+  });
+  toast(r.ok ? 'Credential saved' : 'Error: ' + JSON.stringify(r.data)); refreshAll();
+}
+async function delCred(p, c) { await api(`/api/providers/credentials/${encodeURIComponent(p)}/${encodeURIComponent(c)}`, { method: 'DELETE' }); refreshAll(); }
+async function startOAuth() {
+  const p = $('oa-prov').value;
+  const r = await api(`/api/oauth/${encodeURIComponent(p)}/authorize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  $('oa-out').textContent = JSON.stringify(r.data, null, 2);
+}
+async function triggerOAuthSweep() {
+  const r = await api('/api/oauth/sweep', { method: 'POST' });
+  $('oa-out').textContent = JSON.stringify(r.data, null, 2);
+}
+async function createCombo() {
+  const models = JSON.parse($('cb-models').value);
+  const r = await api('/api/combos', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: $('cb-name').value.trim(), strategy: $('cb-strat').value, models })
+  });
+  toast(r.ok ? 'Combo saved' : 'Error: ' + JSON.stringify(r.data)); refreshAll();
+}
+async function delCombo(id) { await api('/api/combos/' + encodeURIComponent(id), { method: 'DELETE' }); refreshAll(); }
+async function simulateRoute() {
+  const body = { model: $('sim-model').value.trim() };
+  if ($('sim-strat').value) body.strategy = $('sim-strat').value;
+  const r = await api('/api/combos/simulate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  $('sim-out').textContent = JSON.stringify(r.data, null, 2);
+}
+async function createApiKey() {
+  const body = { label: $('key-label').value.trim() || 'dashboard' };
+  const rpm = parseInt($('key-rpm').value, 10); if (rpm > 0) body.rpm_limit = rpm;
+  const r = await api('/api/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  $('key-created').style.display = 'block';
+  $('key-created').textContent = JSON.stringify(r.data, null, 2);
+  refreshAll();
+}
+async function addGuardPattern() {
+  const r = await api('/api/guardrails/patterns', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: $('gr-name').value.trim(), regex: $('gr-regex').value.trim() })
+  });
+  toast(r.ok ? 'Guardrail pattern added' : 'Invalid regex'); refreshAll();
+}
+async function saveCompression() {
+  await api('/api/settings/compression', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: $('cp-en').checked, rtk_intensity: $('cp-rtk').value, caveman_intensity: $('cp-cav').value })
+  });
+  toast('Compression settings updated'); refreshAll();
+}
+async function saveCache() {
+  await api('/api/settings/cache', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: $('sc-en').checked, similarity_threshold: parseFloat($('sc-sim').value), require_zero_temperature: $('sc-zero').checked })
+  });
+  toast('Semantic cache updated'); refreshAll();
+}
+async function clearCache() { await api('/api/cache/clear', { method: 'POST' }); toast('Cache cleared'); refreshAll(); }
+async function startMitm() {
+  const r = await api('/api/mitm/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ port: parseInt($('mt-port').value, 10) || 20443, gateway_base_url: window.location.origin })
+  });
+  $('mt-out').textContent = JSON.stringify(r.data, null, 2); refreshAll();
+}
+async function stopMitm() { const r = await api('/api/mitm/stop', { method: 'POST' }); $('mt-out').textContent = JSON.stringify(r.data, null, 2); refreshAll(); }
+async function rotateMitmCa() { const r = await api('/api/mitm/regenerate-cert', { method: 'POST' }); $('mt-out').textContent = JSON.stringify(r.data, null, 2); toast('MITM Root CA rotated'); }
+async function runA2A() {
+  const r = await api('/a2a', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 'ui-1', method: 'message/send', params: { skill: $('a2a-skill').value, messages: [{ role: 'user', content: $('a2a-msg').value }] } })
+  });
+  $('a2a-out').textContent = JSON.stringify(r.data, null, 2);
+}
+async function addMemory() {
+  const r = await api('/api/memory', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: $('mem-key').value.trim(), content: $('mem-content').value.trim() })
+  });
+  toast(r.ok ? 'Memory stored' : 'Error'); refreshAll();
+}
+async function searchMemory() {
+  const r = await api('/api/memory/retrieve', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: $('mem-q').value.trim(), top_k: 5 })
+  });
+  $('mem-out').textContent = JSON.stringify(r.data, null, 2);
+}
+async function addSkill() {
+  const r = await api('/api/skills', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: $('sk-name').value.trim(), description: $('sk-desc').value.trim(), instructions: $('sk-inst').value.trim() })
+  });
+  toast(r.ok ? 'Skill installed' : 'Error'); refreshAll();
+}
+async function runDbBackup() {
+  const r = await api('/api/db/backup', { method: 'POST' });
+  $('db-imp-out').textContent = JSON.stringify(r.data, null, 2);
+  toast(r.ok ? 'SQLite backup created' : 'Backup failed');
+}
+async function importUpstreamSqlite() {
+  const r = await api('/api/db/import/upstream-sqlite', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: $('db-path').value.trim() })
+  });
+  $('db-imp-out').textContent = JSON.stringify(r.data, null, 2);
+  toast(r.ok ? 'Upstream SQLite imported!' : 'Import failed');
+  refreshAll();
+}
+
+$('api-key-input').value = getKey();
+refreshAll();
+</script>
+</body>
+</html>
