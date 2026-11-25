@@ -36,3 +36,34 @@ export function fmtRelativeExpiry(ms?: number | null): string {
   if (hrs < 48) return `in ${hrs}h`;
   return `in ${Math.floor(hrs / 24)}d`;
 }
+
+/**
+ * Reliable clipboard copy that works on both HTTPS/localhost and plain HTTP LAN IPs
+ * (e.g. http://192.168.11.209:20128) where navigator.clipboard is blocked by browsers.
+ */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (window.isSecureContext && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through to legacy textarea copy
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-9999px";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}

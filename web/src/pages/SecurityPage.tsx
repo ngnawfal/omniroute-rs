@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ShieldCheck, KeyRound, Copy, Plus, Lock, Bell, Send, Unlock } from "lucide-react";
+import { ShieldCheck, KeyRound, Copy, Plus, Lock, Bell, Send, Unlock, Eye, EyeOff, Trash2 } from "lucide-react";
 import {
   Card,
   CardHeader,
@@ -14,7 +14,8 @@ import {
   PageHeader,
   EmptyState,
 } from "@/components/ui/primitives";
-import { api, apiDelete, apiPost, apiPut } from "@/lib/api";
+import { api, apiDelete, apiPost, apiPut, getStoredApiKey, setStoredApiKey } from "@/lib/api";
+import { copyToClipboard } from "@/lib/utils";
 
 export function SecurityPage({
   keys,
@@ -34,6 +35,7 @@ export function SecurityPage({
   const [label, setLabel] = useState("");
   const [rpm, setRpm] = useState("");
   const [createdKey, setCreatedKey] = useState<string | null>(null);
+  const [revealedKeys, setRevealedKeys] = useState<Record<string, boolean>>({});
   const [ruleName, setRuleName] = useState("");
   const [ruleRegex, setRuleRegex] = useState("");
 
@@ -136,14 +138,35 @@ export function SecurityPage({
     const rNum = Number.parseInt(rpm, 10);
     if (rNum > 0) body.rpm_limit = rNum;
     const r = await apiPost("/api/keys", body);
-    if (r.ok) {
-      setCreatedKey(r.data.key);
+    if (r.ok && r.data?.key) {
+      const k = String(r.data.key);
+      // Automatically store in browser so dashboard stays authenticated!
+      setStoredApiKey(k);
+      setCreatedKey(k);
       setLabel("");
       setRpm("");
-      onToast("API key generated — copy it now!", "success");
+      const copied = await copyToClipboard(k);
+      onToast(
+        copied ? "API key created, activated & copied!" : "API key created & activated!",
+        "success"
+      );
       onRefresh();
     } else {
       onToast(r.error || "Failed to generate key", "error");
+    }
+  };
+
+  const deleteApiKey = async (fullKey: string) => {
+    const r = await apiDelete(`/api/keys/${encodeURIComponent(fullKey)}`);
+    if (r.ok) {
+      if (getStoredApiKey() === fullKey) {
+        const next = keys.find((k: any) => k.key && k.key !== fullKey && !k.disabled);
+        setStoredApiKey(next?.key || "");
+      }
+      onToast("API key deleted", "info");
+      onRefresh();
+    } else {
+      onToast(r.error || "Failed to delete key", "error");
     }
   };
 
@@ -229,9 +252,9 @@ export function SecurityPage({
                 <Button
                   variant="primary"
                   size="sm"
-                  onClick={() => {
-                    navigator.clipboard.writeText(createdKey);
-                    onToast("API key copied", "info");
+                  onClick={async () => {
+                    const ok = await copyToClipboard(createdKey);
+                    onToast(ok ? "API key copied" : "Copy failed", ok ? "info" : "error");
                   }}
                 >
                   <Copy className="h-3.5 w-3.5" /> Copy
@@ -243,32 +266,72 @@ export function SecurityPage({
               <EmptyState
                 icon={<Lock className="h-5 w-5" />}
                 title="Open-door local mode"
-                description="Generate your first API key above to enforce strict Bearer authentication on /v1/* endpoints."
+                description="Without keys, any tool can connect using any placeholder key (e.g. omniroute-local). Generate a key above to enforce strict Bearer auth."
               />
             ) : (
               <div className="overflow-x-auto rounded-lg border border-border">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-surface-subtle text-fg-muted">
                     <tr>
-                      <th className="px-3 py-2 font-medium">Preview</th>
+                      <th className="px-3 py-2 font-medium">Key</th>
                       <th className="px-3 py-2 font-medium">Label</th>
                       <th className="px-3 py-2 font-medium">RPM</th>
-                      <th className="px-3 py-2 font-medium">Status</th>
+                      <th className="px-3 py-2 font-medium text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
-                    {keys.map((k: any, i: number) => (
-                      <tr key={i}>
-                        <td className="px-3 py-2 font-mono">{k.key_preview}</td>
-                        <td className="px-3 py-2 font-medium text-fg">{k.label || "—"}</td>
-                        <td className="px-3 py-2 font-mono">{k.rpm_limit ?? "∞"}</td>
-                        <td className="px-3 py-2">
-                          <Badge variant={k.disabled ? "danger" : "success"}>
-                            {k.disabled ? "disabled" : "active"}
-                          </Badge>
-                        </td>
-                      </tr>
-                    ))}
+                    {keys.map((k: any, i: number) => {
+                      const fullKey: string = k.key || "";
+                      const rowId = k.key_hash || String(i);
+                      const shown = !!revealedKeys[rowId];
+                      return (
+                        <tr key={rowId}>
+                          <td className="px-3 py-2 font-mono max-w-[200px] truncate">
+                            {shown && fullKey ? fullKey : k.key_preview}
+                          </td>
+                          <td className="px-3 py-2 font-medium text-fg">{k.label || "—"}</td>
+                          <td className="px-3 py-2 font-mono">{k.rpm_limit ?? "∞"}</td>
+                          <td className="px-3 py-2">
+                            <div className="flex items-center justify-end gap-1">
+                              {fullKey && (
+                                <>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    title={shown ? "Hide key" : "Show full key"}
+                                    onClick={() =>
+                                      setRevealedKeys((p) => ({ ...p, [rowId]: !p[rowId] }))
+                                    }
+                                  >
+                                    {shown ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    title="Copy key"
+                                    onClick={async () => {
+                                      setStoredApiKey(fullKey);
+                                      const ok = await copyToClipboard(fullKey);
+                                      onToast(ok ? "API key copied" : "Copy failed", ok ? "info" : "error");
+                                    }}
+                                  >
+                                    <Copy className="h-3.5 w-3.5" />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    title="Delete key"
+                                    onClick={() => void deleteApiKey(fullKey)}
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5 text-danger" />
+                                  </Button>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

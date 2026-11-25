@@ -278,6 +278,7 @@ export default function App() {
           theme={theme}
           appearance={appearance}
           hasApiKey={hasApiKey}
+          keysCount={keys.length}
           dashboardLocked={authState.locked}
           refreshing={refreshing}
           onOpenMobile={() => setMobileOpen(true)}
@@ -298,10 +299,13 @@ export default function App() {
                 health={health}
                 gamification={gamification}
                 credentials={credentials}
+                keys={keys}
                 isDark={isDark}
                 onNavigate={setActiveTab}
                 onLaunchOAuth={launchOAuth}
                 onOpenAddCred={(p) => setCredModal({ open: true, provider: p || "" })}
+                onOpenApiKeys={() => setApiKeyOpen(true)}
+                onRefresh={() => void refreshAll()}
                 onToast={addToast}
               />
             )}
@@ -432,12 +436,13 @@ export default function App() {
 
       <ApiKeyModal
         open={apiKeyOpen}
+        keys={keys}
         onClose={() => setApiKeyOpen(false)}
         onChange={() => {
           setHasApiKey(!!getStoredApiKey());
-          addToast(getStoredApiKey() ? "Gateway API key saved" : "Gateway API key cleared", "info");
           void refreshAll();
         }}
+        onToast={addToast}
       />
 
       <ToastStack

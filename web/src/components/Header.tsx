@@ -18,6 +18,7 @@ export function Header({
   theme,
   appearance,
   hasApiKey,
+  keysCount = 0,
   dashboardLocked,
   refreshing,
   onOpenMobile,
@@ -32,6 +33,7 @@ export function Header({
   theme: "dark" | "light";
   appearance: "editions" | "classic";
   hasApiKey: boolean;
+  keysCount?: number;
   dashboardLocked?: boolean;
   refreshing: boolean;
   onOpenMobile: () => void;
@@ -117,18 +119,21 @@ export function Header({
           <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
         </Button>
 
-        {/* API Key Modal Trigger */}
+        {/* Quick Connect & API Keys Modal Trigger */}
         <Button
-          variant={hasApiKey ? "primary" : "default"}
+          variant={hasApiKey || keysCount > 0 ? "primary" : "default"}
           size="sm"
           onClick={onOpenApiKey}
+          title="Generate, copy & manage Gateway API keys and Base URLs"
         >
           {hasApiKey ? (
             <CheckCircle2 className="h-3.5 w-3.5" />
           ) : (
             <KeyRound className="h-3.5 w-3.5" />
           )}
-          <span className="hidden sm:inline">{hasApiKey ? "Key Active" : "API Key"}</span>
+          <span className="hidden sm:inline">
+            {keysCount > 0 ? `Connect · ${keysCount} Key${keysCount > 1 ? "s" : ""}` : "Connect / Keys"}
+          </span>
         </Button>
 
         {dashboardLocked && onLogout && (

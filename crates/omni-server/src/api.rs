@@ -429,11 +429,11 @@ pub struct CreateKeyBody {
 }
 
 pub async fn list_keys(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let rows = state.store.list_api_key_rows().unwrap_or_default();
-    let masked: Vec<Value> = rows
+    let items: Vec<Value> = rows
         .into_iter()
         .map(|k| {
             let preview = if k.key.len() > 8 {
@@ -442,6 +442,7 @@ pub async fn list_keys(State(state): State<SharedState>, headers: HeaderMap) -> 
                 "***".into()
             };
             json!({
+                "key": k.key,
                 "key_preview": preview,
                 "key_hash": hash_api_key(&k.key),
                 "label": k.label,
@@ -453,7 +454,7 @@ pub async fn list_keys(State(state): State<SharedState>, headers: HeaderMap) -> 
             })
         })
         .collect();
-    json_ok(json!({"keys": masked}))
+    json_ok(json!({"keys": items}))
 }
 
 pub async fn create_key(
@@ -461,7 +462,7 @@ pub async fn create_key(
     headers: HeaderMap,
     axum::Json(body): axum::Json<CreateKeyBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let now = now_ms();
@@ -491,7 +492,7 @@ pub async fn delete_key(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let deleted = state.store.delete_api_key(&key).unwrap_or(false);

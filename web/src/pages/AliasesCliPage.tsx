@@ -21,7 +21,8 @@ import {
   EmptyState,
 } from "@/components/ui/primitives";
 import { ProviderIcon } from "@/components/ProviderIcon";
-import { api, apiDelete, apiPost } from "@/lib/api";
+import { api, apiDelete, apiPost, setStoredApiKey } from "@/lib/api";
+import { copyToClipboard } from "@/lib/utils";
 
 const ALIAS_PRESETS = [
   { alias: "gpt-4o", target: "antigravity/claude-sonnet-4-6" },
@@ -87,11 +88,27 @@ export function AliasesCliPage({
   };
 
   const copyText = async (text: string, label: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
+    const ok = await copyToClipboard(text);
+    if (ok) {
       onToast(`${label} copied to clipboard`, "info");
-    } catch {
-      onToast("Clipboard access blocked by browser", "error");
+    } else {
+      onToast("Copy failed — select text manually", "error");
+    }
+  };
+
+  const quickGenerateKey = async () => {
+    const r = await apiPost("/api/keys", { label: "cli-tools" });
+    if (r.ok && r.data?.key) {
+      const k = String(r.data.key);
+      setStoredApiKey(k);
+      const copied = await copyToClipboard(k);
+      onToast(
+        copied ? "API key created, embedded in all snippets & copied!" : "API key created & embedded!",
+        "success"
+      );
+      void loadAll();
+    } else {
+      onToast(r.error || "Failed to generate API key", "error");
     }
   };
 
@@ -103,16 +120,22 @@ export function AliasesCliPage({
         title="Model Aliases, CLI Tools & OpenAPI"
         description="Map client model names to any provider/combo and copy drop-in configs for Claude Code, Codex CLI, Cline, Continue, Aider, OpenCode & Cursor."
         actions={
-          <a
-            href="/api/openapi"
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-3 text-xs font-medium text-fg hover:bg-surface-subtle"
-          >
-            <FileCode2 className="h-3.5 w-3.5 text-accent-ink" />
-            OpenAPI 3.1 JSON
-            <ExternalLink className="h-3 w-3 text-fg-muted" />
-          </a>
+          <div className="flex items-center gap-2">
+            <Button variant="primary" size="sm" onClick={() => void quickGenerateKey()}>
+              <Plus className="h-3.5 w-3.5" />
+              1-Click API Key
+            </Button>
+            <a
+              href="/api/openapi"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-3 text-xs font-medium text-fg hover:bg-surface-subtle"
+            >
+              <FileCode2 className="h-3.5 w-3.5 text-accent-ink" />
+              OpenAPI 3.1 JSON
+              <ExternalLink className="h-3 w-3 text-fg-muted" />
+            </a>
+          </div>
         }
       />
 

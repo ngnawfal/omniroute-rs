@@ -24,9 +24,11 @@ import {
   SegmentedControl,
 } from "@/components/ui/primitives";
 import { ProviderIcon } from "@/components/ProviderIcon";
-import { fmtCost, fmtNumber } from "@/lib/utils";
+import { copyToClipboard, fmtCost, fmtNumber } from "@/lib/utils";
 import {
+  apiPost,
   getStoredApiKey,
+  setStoredApiKey,
   type CredentialItem,
   type GamificationStatus,
   type GatewayHealth,
@@ -46,26 +48,53 @@ export function OverviewPage({
   health,
   gamification,
   credentials,
+  keys = [],
   isDark,
   onNavigate,
   onLaunchOAuth,
   onOpenAddCred,
+  onOpenApiKeys,
+  onRefresh,
   onToast,
 }: {
   health: GatewayHealth | null;
   gamification: GamificationStatus | null;
   credentials: CredentialItem[];
+  keys?: any[];
   isDark: boolean;
   onNavigate: (tab: NavTab) => void;
   onLaunchOAuth: (providerId: string, displayName: string) => void;
   onOpenAddCred: (providerId?: string) => void;
+  onOpenApiKeys?: () => void;
+  onRefresh?: () => void;
   onToast: (msg: string, tone?: "success" | "error" | "info") => void;
 }) {
   const [sdkTab, setSdkTab] = useState<"openai" | "claude" | "curl" | "mcp">("openai");
   const [copied, setCopied] = useState(false);
+  const [genKeyBusy, setGenKeyBusy] = useState(false);
 
   const origin = window.location.origin;
-  const apiKey = getStoredApiKey() || "sk-omni-your-key";
+  const firstDbKey = keys.find((k: any) => !k.disabled && k.key)?.key || "";
+  const apiKey = getStoredApiKey() || firstDbKey || "omniroute-local";
+  const hasRealKey = !!(getStoredApiKey() || firstDbKey);
+
+  const quickCreateKey = async () => {
+    setGenKeyBusy(true);
+    const r = await apiPost("/api/keys", { label: "quick-connect" });
+    setGenKeyBusy(false);
+    if (r.ok && r.data?.key) {
+      const k = String(r.data.key);
+      setStoredApiKey(k);
+      const ok = await copyToClipboard(k);
+      onToast(
+        ok ? "API key generated, activated & copied!" : "API key generated & activated!",
+        "success"
+      );
+      onRefresh?.();
+    } else {
+      onToast(r.error || "Failed to generate API key", "error");
+    }
+  };
 
   const snippets: Record<typeof sdkTab, string> = {
     openai: `from openai import OpenAI
@@ -96,12 +125,12 @@ claude`,
   };
 
   const copySnippet = async () => {
-    try {
-      await navigator.clipboard.writeText(snippets[sdkTab]);
+    const ok = await copyToClipboard(snippets[sdkTab]);
+    if (ok) {
       setCopied(true);
       onToast("Snippet copied to clipboard", "info");
       setTimeout(() => setCopied(false), 1800);
-    } catch {
+    } else {
       onToast("Copy failed", "error");
     }
   };
@@ -299,6 +328,43 @@ claude`,
             />
           </CardHeader>
           <CardContent className="space-y-4">
+            {/* Inline 1-Click API Key Bar */}
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-surface-subtle/50 px-3 py-2.5">
+              <div className="flex items-center gap-2 min-w-0">
+                <KeyRound className="h-3.5 w-3.5 shrink-0 text-accent-ink" />
+                <Badge variant={hasRealKey ? "accent" : "success"}>
+                  {hasRealKey ? "API Key" : "Open Local"}
+                </Badge>
+                <code className="truncate font-mono text-xs text-fg">{apiKey}</code>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={async () => {
+                    const ok = await copyToClipboard(apiKey);
+                    onToast(ok ? "API key copied" : "Copy failed", ok ? "info" : "error");
+                  }}
+                >
+                  <Copy className="h-3.5 w-3.5" /> Copy Key
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  disabled={genKeyBusy}
+                  onClick={() => void quickCreateKey()}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  {genKeyBusy ? "Creating..." : "New Key"}
+                </Button>
+                {onOpenApiKeys && (
+                  <Button variant="ghost" size="sm" onClick={onOpenApiKeys}>
+                    Manage
+                  </Button>
+                )}
+              </div>
+            </div>
+
             <div className="relative overflow-hidden rounded-xl border border-border bg-[#0d100e] text-[#eef2ee]">
               <button
                 type="button"
@@ -322,10 +388,9 @@ claude`,
                 <button
                   key={ep.label}
                   type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(ep.url).then(() =>
-                      onToast(`Copied ${ep.label}`, "info")
-                    );
+                  onClick={async () => {
+                    const ok = await copyToClipboard(ep.url);
+                    onToast(ok ? `Copied ${ep.label}` : "Copy failed", ok ? "info" : "error");
                   }}
                   className="flex flex-col rounded-lg border border-border bg-surface-subtle/60 px-3 py-2 text-left transition-colors hover:border-border-strong cursor-pointer"
                 >

@@ -1022,11 +1022,23 @@ pub async fn get_cli_tools_config(
     let v1_url = format!("{base_url}/v1");
 
     let has_keys = state.store.has_api_keys().unwrap_or(false);
-    let key_placeholder = if has_keys {
-        "YOUR_OMNIROUTE_API_KEY"
+    let caller_authed = authorize_management(&state, &headers).is_ok();
+    let active_key = if !has_keys {
+        "omniroute-local".to_string()
+    } else if caller_authed {
+        crate::chat::extract_api_key(&headers)
+            .or_else(|| {
+                state
+                    .store
+                    .list_api_key_rows()
+                    .ok()
+                    .and_then(|rows| rows.into_iter().find(|r| !r.disabled).map(|r| r.key))
+            })
+            .unwrap_or_else(|| "YOUR_OMNIROUTE_API_KEY".to_string())
     } else {
-        "omniroute-local"
+        "YOUR_OMNIROUTE_API_KEY".to_string()
     };
+    let key_placeholder = active_key.as_str();
 
     // Pick a smart default model from configured credentials or combos
     let default_model = state
