@@ -88,8 +88,8 @@ pub fn profile_for(provider: &str) -> &'static ProviderProfile {
         return &LOCAL_PROFILE;
     }
     match provider {
-        "claude" | "codex" | "chatgpt" | "antigravity" | "kimi-coding" | "copilot" | "cline"
-        | "cursor" | "gemini-cli" | "colab" | "qwen-code" | "kiro" => &OAUTH_PROFILE,
+        "claude" | "codex" | "chatgpt" | "antigravity" | "agy" | "kimi-coding" | "copilot"
+        | "cline" | "cursor" | "gemini-cli" | "colab" | "qwen-code" | "kiro" => &OAUTH_PROFILE,
         _ => &APIKEY_PROFILE,
     }
 }
@@ -114,29 +114,26 @@ static PROVIDER_FAILURE_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lockout_key(provider: &str, conn: &str, model: &str) -> String {
-    format!("{provider}::{conn}::{model}")
+    let scoped_model = crate::antigravity::quota_scoped_model(provider, model);
+    format!("{provider}::{conn}::{scoped_model}")
 }
 
-/// Lock provider+connection+model for cooldownMs. Longest-of wins.
-pub fn lock_model(
+fn lock_single(
+    map: &mut HashMap<String, ModelLockout>,
     provider: &str,
     connection_id: &str,
-    model: &str,
+    scoped_model: &str,
     reason: &str,
     cooldown_ms: u64,
     failure_count: u32,
 ) {
-    if model.is_empty() || cooldown_ms == 0 {
-        return;
-    }
-    let key = lockout_key(provider, connection_id, model);
+    let key = format!("{provider}::{connection_id}::{scoped_model}");
     let now = Instant::now();
     let new_until = now + Duration::from_millis(cooldown_ms);
-    let mut map = LOCKOUTS.lock().unwrap();
     let entry = map.entry(key).or_insert_with(|| ModelLockout {
         provider: provider.to_string(),
         connection_id: connection_id.to_string(),
-        model: model.to_string(),
+        model: scoped_model.to_string(),
         reason: reason.to_string(),
         until: new_until,
         locked_at: now,
@@ -149,6 +146,30 @@ pub fn lock_model(
         entry.reset_after_ms = cooldown_ms;
     }
     entry.failure_count = entry.failure_count.max(failure_count);
+}
+
+/// Lock provider+connection+model for cooldownMs. Longest-of wins.
+/// For Antigravity/`agy`, locks are scoped by quota family (`family:gemini`, `family:claude`,
+/// `family:argon`) and mirrored across both `antigravity` and `agy` for the same connection.
+pub fn lock_model(
+    provider: &str,
+    connection_id: &str,
+    model: &str,
+    reason: &str,
+    cooldown_ms: u64,
+    failure_count: u32,
+) {
+    if model.is_empty() || cooldown_ms == 0 {
+        return;
+    }
+    let scoped = crate::antigravity::quota_scoped_model(provider, model);
+    let mut map = LOCKOUTS.lock().unwrap();
+    if crate::antigravity::is_antigravity_provider(provider) {
+        lock_single(&mut map, "antigravity", connection_id, &scoped, reason, cooldown_ms, failure_count);
+        lock_single(&mut map, "agy", connection_id, &scoped, reason, cooldown_ms, failure_count);
+    } else {
+        lock_single(&mut map, provider, connection_id, &scoped, reason, cooldown_ms, failure_count);
+    }
 }
 
 pub fn is_model_locked(provider: &str, connection_id: &str, model: &str) -> bool {
@@ -188,10 +209,14 @@ pub fn get_lockout(provider: &str, connection_id: &str, model: &str) -> Option<M
 }
 
 pub fn clear_model_lock(provider: &str, connection_id: &str, model: &str) {
-    LOCKOUTS
-        .lock()
-        .unwrap()
-        .remove(&lockout_key(provider, connection_id, model));
+    let mut map = LOCKOUTS.lock().unwrap();
+    if crate::antigravity::is_antigravity_provider(provider) {
+        let scoped = crate::antigravity::quota_scoped_model(provider, model);
+        map.remove(&format!("antigravity::{connection_id}::{scoped}"));
+        map.remove(&format!("agy::{connection_id}::{scoped}"));
+    } else {
+        map.remove(&lockout_key(provider, connection_id, model));
+    }
 }
 
 pub fn clear_all_lockouts() {

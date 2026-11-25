@@ -988,6 +988,7 @@ pub(crate) async fn execute_chat_pipeline(
                                 cooldown_ms: 2_000,
                                 is_terminal: false,
                                 is_rate_limit: false,
+                                is_local_refusal_replay: false,
                             });
                             continue;
                         }
@@ -1013,7 +1014,12 @@ pub(crate) async fn execute_chat_pipeline(
                             session_id: String::new(),
                         });
                     }
-                    if fail.is_rate_limit {
+                    // Skip outer cooldown-aware retry loop for Antigravity/agy 429s & local
+                    // refusal replays so we never multiply upstream 429 attempts (antigravity429Guard.ts).
+                    if fail.is_rate_limit
+                        && !fail.is_local_refusal_replay
+                        && !omni_exec::antigravity::is_antigravity_provider(&conn.provider)
+                    {
                         let wait = fail.retry_after_ms.unwrap_or(fail.cooldown_ms);
                         shortest_rate_wait_ms =
                             Some(shortest_rate_wait_ms.map(|a| a.min(wait)).unwrap_or(wait));

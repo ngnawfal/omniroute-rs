@@ -817,7 +817,8 @@ pub fn prepare_provider_request(
             }
         }
 
-        // 4. Antigravity & Gemini CLI (OAuth Bearer + multi-endpoint fallback + v1internal envelope)
+        // 4. Antigravity & Gemini CLI (OAuth Bearer + multi-endpoint fallback + v1internal envelope
+        //    + v3.8.55 anti-ban safeguards: native CLI/IDE UA, header scrub, prompt sanitizer, FNV-1a sessionId)
         "antigravity" | "agy" | "gemini-cli" => {
             endpoint.auth_header = AuthHeader::Bearer;
             let project_id = provider_specific
@@ -828,14 +829,35 @@ pub fn prepare_provider_request(
             if !project_id.is_empty() {
                 upsert_header(&mut endpoint.extra_headers, "x-goog-user-project", project_id);
             }
-            let gemini_body = openai_to_gemini(&target_req, stream);
-            let is_antigravity = matches!(provider.id.as_str(), "antigravity" | "agy");
+            let mut gemini_body = openai_to_gemini(&target_req, stream);
+            let is_antigravity = crate::antigravity::is_antigravity_provider(&provider.id);
             let op = if stream {
                 "v1internal:streamGenerateContent?alt=sse"
             } else {
                 "v1internal:generateContent"
             };
             if is_antigravity {
+                // Protection 1: Native CLI/IDE User-Agent + scrub proxy/SDK/Chromium fingerprint headers
+                let native_ua = crate::antigravity::antigravity_content_user_agent(
+                    &provider.id,
+                    provider_specific,
+                );
+                upsert_header(&mut endpoint.extra_headers, "User-Agent", &native_ua);
+                crate::antigravity::scrub_proxy_and_fingerprint_headers(
+                    &mut endpoint.extra_headers,
+                );
+
+                // Protection 2 & 3: Competing-agent prompt sanitizer + UUIDv4 requestId + FNV-1a sessionId + generation defaults
+                crate::antigravity::normalize_antigravity_system_instruction(&mut gemini_body);
+                let identity = crate::antigravity::build_envelope_identity(
+                    provider_specific,
+                    &endpoint.connection_id,
+                );
+                crate::antigravity::apply_antigravity_request_defaults(
+                    &mut gemini_body,
+                    &identity.session_id,
+                );
+
                 let uses_default = endpoint.base_urls.is_empty()
                     || endpoint
                         .base_urls
@@ -852,7 +874,7 @@ pub fn prepare_provider_request(
                     "model": upstream_model,
                     "userAgent": "antigravity",
                     "requestType": "agent",
-                    "requestId": format!("agent-{}", Utc::now().timestamp_millis()),
+                    "requestId": identity.request_id,
                     "request": gemini_body
                 });
                 PreparedExecution {

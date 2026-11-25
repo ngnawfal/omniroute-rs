@@ -111,6 +111,9 @@ pub struct DispatchFailure {
     pub cooldown_ms: u64,
     pub is_terminal: bool,
     pub is_rate_limit: bool,
+    /// True when Antigravity's anti-hammering 429 refusal guard answered locally without
+    /// hitting upstream (so the caller must not re-try or cool the whole account).
+    pub is_local_refusal_replay: bool,
 }
 
 pub struct Dispatcher {
@@ -244,6 +247,9 @@ fn build_post_request(
     conn: &ConnectionEndpoint,
     stream: bool,
 ) -> reqwest::RequestBuilder {
+    let is_ag = crate::antigravity::is_antigravity_provider(&conn.provider);
+    let is_agy_cli = conn.provider.eq_ignore_ascii_case("agy");
+
     let mut req = dispatcher
         .client
         .post(url)
@@ -251,20 +257,48 @@ fn build_post_request(
     if let Some(ms) = conn.timeout_ms {
         req = req.timeout(Duration::from_millis(ms));
     }
-    if let Some(hname) = conn.auth_header.header_name() {
-        if !conn.api_key.is_empty() {
-            req = req.header(
-                hname,
-                conn.auth_header
-                    .render_value(&conn.api_key, conn.auth_prefix.as_deref()),
-            );
-        }
-    }
-    if stream && !conn.extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+    // Upstream `antigravity.ts`: native Go CLI (`agy`) requests SSE via `?alt=sse` alone and
+    // sends no `Accept: text/event-stream` header.
+    if stream
+        && !is_agy_cli
+        && !conn
+            .extra_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
+    {
         req = req.header("Accept", "text/event-stream");
     }
-    for (k, v) in &conn.extra_headers {
-        req = req.header(k.as_str(), v.as_str());
+
+    if is_ag {
+        // Place scrubbed headers first and defer `Authorization` to the final header
+        // (exact wire order matching native Antigravity fingerprint in antigravityHeaderScrub.ts).
+        for (k, v) in &conn.extra_headers {
+            if !k.eq_ignore_ascii_case("authorization") {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+        if let Some(hname) = conn.auth_header.header_name() {
+            if !conn.api_key.is_empty() {
+                req = req.header(
+                    hname,
+                    conn.auth_header
+                        .render_value(&conn.api_key, conn.auth_prefix.as_deref()),
+                );
+            }
+        }
+    } else {
+        if let Some(hname) = conn.auth_header.header_name() {
+            if !conn.api_key.is_empty() {
+                req = req.header(
+                    hname,
+                    conn.auth_header
+                        .render_value(&conn.api_key, conn.auth_prefix.as_deref()),
+                );
+            }
+        }
+        for (k, v) in &conn.extra_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
     }
     req
 }
@@ -385,11 +419,48 @@ pub async fn dispatch_once_detailed(
 ) -> Result<reqwest::Response, DispatchFailure> {
     let mut last: Option<DispatchFailure> = None;
     let profile = resilience::profile_for(&conn.provider);
+    let is_ag = crate::antigravity::is_antigravity_provider(&conn.provider);
+
+    // Protection 4 (Anti-Hammering 429 Refusal Guard): check whether this exact request body
+    // was already refused by Antigravity. If active, answer 429 locally with ZERO upstream calls.
+    let ag_fingerprint = if is_ag {
+        let fp = crate::antigravity::fingerprint_antigravity_request(&conn.connection_id, body);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some((remaining_ms, strikes)) = crate::antigravity::get_active_refusal(&fp, now_ms) {
+            return Err(DispatchFailure {
+                error: OmniError::Upstream {
+                    status: 429,
+                    body: Some(crate::antigravity::build_refusal_replay_body(
+                        remaining_ms,
+                        strikes,
+                    )),
+                },
+                retry_after_ms: Some(remaining_ms),
+                cooldown_ms: remaining_ms,
+                is_terminal: false,
+                is_rate_limit: true,
+                is_local_refusal_replay: true,
+            });
+        }
+        Some(fp)
+    } else {
+        None
+    };
+    let ag_429_budget = if is_ag {
+        crate::antigravity::get_antigravity_429_attempt_budget()
+    } else {
+        u32::MAX
+    };
+    let mut ag_429_seen: u32 = 0;
+
+    let total_urls = conn.base_urls.iter().filter(|u| !u.is_empty()).count();
+    let mut url_idx: usize = 0;
 
     for url in &conn.base_urls {
         if url.is_empty() {
             continue;
         }
+        url_idx += 1;
         let resp = match attempt(dispatcher, url, conn, body, stream).await {
             Ok(r) => r,
             Err(OmniError::Upstream { status, body: payload_opt }) => {
@@ -406,6 +477,7 @@ pub async fn dispatch_once_detailed(
                     cooldown_ms,
                     is_terminal: resilience::is_terminal_status(status),
                     is_rate_limit: status == 429,
+                    is_local_refusal_replay: false,
                 });
                 continue;
             }
@@ -432,6 +504,7 @@ pub async fn dispatch_once_detailed(
                     cooldown_ms: cd,
                     is_terminal: false,
                     is_rate_limit: false,
+                    is_local_refusal_replay: false,
                 });
                 continue;
             }
@@ -488,7 +561,22 @@ pub async fn dispatch_once_detailed(
             cooldown_ms,
             is_terminal,
             is_rate_limit,
+            is_local_refusal_replay: false,
         });
+
+        // Bounded per-request 429 budget for Antigravity / `agy`: once exhausted (or after
+        // exhausting all configured hosts with 429), remember this request fingerprint locally
+        // and stop retrying remaining fallback hosts.
+        if is_ag && status == 429 {
+            ag_429_seen += 1;
+            if ag_429_seen >= ag_429_budget || url_idx >= total_urls {
+                if let Some(ref fp) = ag_fingerprint {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let _ = crate::antigravity::remember_429_refusal(fp, retry_after_ms, now_ms);
+                }
+                break;
+            }
+        }
     }
 
     Err(last.unwrap_or(DispatchFailure {
@@ -497,6 +585,7 @@ pub async fn dispatch_once_detailed(
         cooldown_ms: TRANSIENT_INITIAL_MS,
         is_terminal: false,
         is_rate_limit: false,
+        is_local_refusal_replay: false,
     }))
 }
 
@@ -654,5 +743,103 @@ mod tests {
         let mut out2 = String::new();
         dec2.read_to_string(&mut out2).unwrap();
         assert_eq!(out2, signed, "signed cch= body must stay byte-identical");
+    }
+
+    #[test]
+    fn antigravity_family_lockout_isolates_claude_from_gemini_and_mirrors_agy() {
+        resilience::clear_all_lockouts();
+        resilience::lock_model("agy", "acct-1", "claude-sonnet-4-6", "rate_limit", 60_000, 1);
+
+        // Same family (Claude) must be locked across both `agy` and `antigravity`
+        assert!(resilience::is_model_locked("agy", "acct-1", "claude-opus-4-6"));
+        assert!(resilience::is_model_locked("antigravity", "acct-1", "claude-sonnet-4-6"));
+
+        // Different family (Gemini) on the SAME account must stay completely open
+        assert!(!resilience::is_model_locked("agy", "acct-1", "gemini-2.5-pro"));
+        assert!(!resilience::is_model_locked("antigravity", "acct-1", "gemini-2.5-flash"));
+
+        resilience::clear_model_lock("antigravity", "acct-1", "claude-sonnet-4-6");
+        assert!(!resilience::is_model_locked("agy", "acct-1", "claude-opus-4-6"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_429_refusal_guard_caps_upstream_hits_and_replays_locally() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::antigravity::reset_429_guard_for_tests();
+        resilience::clear_all_lockouts();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let dispatcher = Dispatcher::new();
+        let url = format!("http://127.0.0.1:{port}/v1internal:generateContent");
+        // Provide 3 fallback hosts: default budget (2) must stop after 2 hits, NOT 3!
+        let conn = ConnectionEndpoint {
+            provider: "agy".into(),
+            connection_id: "ag-test-conn".into(),
+            model: "claude-sonnet-4-6".into(),
+            auth_type: AuthScheme::OAuth,
+            base_urls: vec![url.clone(), url.clone(), url],
+            api_key: "tok_test".into(),
+            auth_header: AuthHeader::Bearer,
+            auth_prefix: None,
+            extra_headers: vec![],
+            timeout_ms: Some(5_000),
+            raw_body_override: None,
+            force_gzip: false,
+        };
+        let env_body = serde_json::json!({
+            "project": "proj-1",
+            "model": "claude-sonnet-4-6",
+            "requestId": "agent/a/1/b/2",
+            "request": {
+                "sessionId": "123",
+                "contents": [{"role": "user", "parts": [{"text": "refuse me"}]}]
+            }
+        });
+
+        let err1 = dispatch_once_detailed(&dispatcher, &conn, &env_body, false, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err1.error.status(), 429);
+        assert!(!err1.is_local_refusal_replay);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "must cap 429 retries at budget=2 across 3 hosts");
+
+        // Second identical request (even with different requestId/sessionId) must replay locally with ZERO upstream calls!
+        let env_body_retry = serde_json::json!({
+            "project": "proj-1",
+            "model": "claude-sonnet-4-6",
+            "requestId": "agent/new/999/z/2",
+            "request": {
+                "sessionId": "999",
+                "contents": [{"role": "user", "parts": [{"text": "refuse me"}]}]
+            }
+        });
+        let err2 = dispatch_once_detailed(&dispatcher, &conn, &env_body_retry, false, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err2.error.status(), 429);
+        assert!(err2.is_local_refusal_replay);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "identical retry must hit 0 upstream requests");
     }
 }
