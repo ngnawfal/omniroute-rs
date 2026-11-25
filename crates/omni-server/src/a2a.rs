@@ -9,7 +9,8 @@
 //   - POST /api/a2a/tasks/{id}/cancel  — Cancel owner-scoped task
 
 use crate::api::build_health_json;
-use crate::chat::{authorize_request, expand_and_order_candidates};
+use crate::chat::{authorize_request, expand_and_order_candidates, extract_api_key};
+use crate::part_a::authorize_management;
 use crate::state::{hash_api_key, now_ms, SharedState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -624,10 +625,10 @@ pub async fn a2a_rpc(
 // ── REST A2A Management Endpoints (/api/a2a/*) ──────────────────────
 
 pub async fn a2a_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    let api_key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let api_key = extract_api_key(&headers);
     let owner = api_key.as_deref().map(hash_api_key).unwrap_or_default();
     let tasks = state.store.list_a2a_tasks(&owner, None, None, 200, 0).unwrap_or_default();
     let completed = tasks.iter().filter(|t| t.state == "completed").count();
@@ -663,10 +664,10 @@ pub async fn list_a2a_tasks(
     headers: HeaderMap,
     Query(q): Query<TaskListQuery>,
 ) -> Response {
-    let api_key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let api_key = extract_api_key(&headers);
     let owner = api_key.as_deref().map(hash_api_key).unwrap_or_default();
     let tasks = state
         .store
@@ -686,10 +687,10 @@ pub async fn get_a2a_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let api_key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let api_key = extract_api_key(&headers);
     let owner = api_key.as_deref().map(hash_api_key).unwrap_or_default();
     match state.store.get_a2a_task(&id, &owner) {
         Ok(Some(task)) => json_status(StatusCode::OK, serde_json::to_value(task).unwrap()),
@@ -702,10 +703,10 @@ pub async fn cancel_a2a_task(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let api_key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let api_key = extract_api_key(&headers);
     let owner = api_key.as_deref().map(hash_api_key).unwrap_or_default();
     match state.store.get_a2a_task(&id, &owner) {
         Ok(Some(mut task)) => {

@@ -55,6 +55,7 @@ impl CavemanIntensity {
 #[serde(rename_all = "kebab-case")]
 pub enum RtkIntensity {
     Off,
+    #[serde(alias = "light", alias = "lite")]
     Minimal,
     Standard,
     Aggressive,
@@ -707,6 +708,15 @@ pub fn compress_chat_request(
                 let removed_toks = estimate_tokens(&serde_json::to_string(&removed).unwrap_or_default());
                 cur = cur.saturating_sub(removed_toks);
                 compacted_turns += 1;
+                // Avoid leaving orphaned `tool` messages after removing their parent assistant tool_calls turn
+                while req.messages.len() > sys_end + keep_tail
+                    && req.messages.get(sys_end).map(|m| m.role.as_str()) == Some("tool")
+                {
+                    let orphan = req.messages.remove(sys_end);
+                    let orphan_toks = estimate_tokens(&serde_json::to_string(&orphan).unwrap_or_default());
+                    cur = cur.saturating_sub(orphan_toks);
+                    compacted_turns += 1;
+                }
             }
             if compacted_turns > 0 {
                 add_tech("context-compaction");

@@ -187,7 +187,7 @@ pub async fn upsert_custom_provider(
     headers: HeaderMap,
     axum::Json(body): axum::Json<UpsertProviderBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     if let Err(e) = state.store.upsert_custom_provider(
@@ -209,7 +209,7 @@ pub async fn delete_custom_provider(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let deleted = state.store.delete_custom_provider(&id).unwrap_or(false);
@@ -221,7 +221,7 @@ pub async fn list_credentials(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let rows = state.store.list_credentials().unwrap_or_default();
@@ -264,7 +264,7 @@ pub async fn upsert_credential(
     headers: HeaderMap,
     axum::Json(body): axum::Json<CredentialRow>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     match state.store.upsert_credential_full(&body) {
@@ -281,7 +281,7 @@ pub async fn delete_credential(
     headers: HeaderMap,
     Path((provider, connection_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let deleted = state
@@ -339,7 +339,7 @@ pub async fn upsert_combo(
     headers: HeaderMap,
     axum::Json(body): axum::Json<UpsertComboBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let now = now_ms();
@@ -373,7 +373,7 @@ pub async fn delete_combo(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let deleted = state.store.delete_combo(&id).unwrap_or(false);
@@ -518,7 +518,7 @@ pub async fn put_settings(
     headers: HeaderMap,
     axum::Json(body): axum::Json<Value>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let now = now_ms();
@@ -570,7 +570,7 @@ pub async fn add_guardrail_pattern(
     headers: HeaderMap,
     axum::Json(body): axum::Json<AddGuardPatternBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let ok = add_custom_guard_pattern(&body.name, &body.regex, Severity::from_str_lossy(&body.severity));
@@ -613,7 +613,7 @@ pub async fn mitm_start(
     headers: HeaderMap,
     body: Option<axum::Json<StartMitmBody>>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let req = body.map(|b| b.0).unwrap_or_default();
@@ -657,7 +657,7 @@ pub async fn mitm_start(
 }
 
 pub async fn mitm_stop(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     if let Some(prev) = state.mitm_handle.lock().unwrap().take() {
@@ -667,7 +667,7 @@ pub async fn mitm_stop(State(state): State<SharedState>, headers: HeaderMap) -> 
 }
 
 pub async fn mitm_regenerate_cert(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     match omni_mitm::cert::CertAuthority::generate() {
@@ -697,7 +697,7 @@ pub async fn mitm_set_bypass(
     headers: HeaderMap,
     axum::Json(body): axum::Json<BypassBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     *state.mitm_bypass.write().unwrap() = body.bypass_patterns.clone();
@@ -718,7 +718,7 @@ pub async fn put_compression_settings(
     headers: HeaderMap,
     axum::Json(body): axum::Json<omni_compress::CompressionConfig>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let serialized = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
@@ -737,7 +737,7 @@ pub async fn put_cache_settings(
     headers: HeaderMap,
     axum::Json(body): axum::Json<omni_cache::SemanticCacheConfig>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let serialized = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
@@ -748,7 +748,7 @@ pub async fn put_cache_settings(
 }
 
 pub async fn clear_cache(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let cleared = state.semantic_cache.clear();
@@ -758,7 +758,7 @@ pub async fn clear_cache(State(state): State<SharedState>, headers: HeaderMap) -
 // ── Database Diagnostics, Upstream Import/Export & Hot Backup (/api/db/*) ─
 
 pub async fn db_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     match state.store.db_diagnostics() {
@@ -777,7 +777,7 @@ pub async fn db_export(
     headers: HeaderMap,
     Query(q): Query<ExportQuery>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     match state.store.export_snapshot(q.include_secrets.unwrap_or(false)) {
@@ -791,7 +791,7 @@ pub async fn db_import_json(
     headers: HeaderMap,
     axum::Json(body): axum::Json<Value>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     match state.store.import_upstream_json(&body) {
@@ -813,7 +813,7 @@ pub async fn db_import_upstream_sqlite(
     headers: HeaderMap,
     axum::Json(body): axum::Json<ImportSqliteBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     if body.path.trim().is_empty() {
@@ -829,7 +829,7 @@ pub async fn db_import_upstream_sqlite(
 }
 
 pub async fn db_backup(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
         return resp;
     }
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");

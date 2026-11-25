@@ -1,6 +1,7 @@
 // Persistent Agent Memory (/api/memory/*) & Skills Registry (/api/skills/*) REST APIs.
 
-use crate::chat::authorize_request;
+use crate::chat::extract_api_key;
+use crate::part_a::authorize_management;
 use crate::state::{hash_api_key, now_ms, SharedState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -37,10 +38,10 @@ pub async fn list_memories(
     headers: HeaderMap,
     Query(q): Query<ListMemoryQuery>,
 ) -> Response {
-    let key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let key = extract_api_key(&headers);
     let kh = key.as_deref().map(hash_api_key);
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
@@ -99,10 +100,10 @@ pub async fn create_memory(
     headers: HeaderMap,
     axum::Json(body): axum::Json<CreateMemoryBody>,
 ) -> Response {
-    let key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let key = extract_api_key(&headers);
     if body.key.trim().is_empty() || body.content.trim().is_empty() {
         return json_status(
             StatusCode::BAD_REQUEST,
@@ -139,7 +140,7 @@ pub async fn get_memory(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     match state.store.get_memory(&id) {
@@ -154,7 +155,7 @@ pub async fn update_memory(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<Value>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let Ok(Some(mut existing)) = state.store.get_memory(&id) else {
@@ -188,7 +189,7 @@ pub async fn delete_memory(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let deleted = state.store.delete_memory(&id).unwrap_or(false);
@@ -213,10 +214,10 @@ pub async fn retrieve_memories(
     headers: HeaderMap,
     axum::Json(body): axum::Json<RetrieveMemoryBody>,
 ) -> Response {
-    let key = match authorize_request(&state, &headers, false) {
-        Ok(k) => k,
-        Err(resp) => return resp,
-    };
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
+    let key = extract_api_key(&headers);
     let kh = key.as_deref().map(hash_api_key);
     let hits = state
         .store
@@ -270,7 +271,7 @@ pub async fn list_skills(
     headers: HeaderMap,
     Query(q): Query<ListSkillsQuery>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let ql = q.q.as_deref().map(|s| s.to_ascii_lowercase());
@@ -346,7 +347,7 @@ pub async fn upsert_skill(
     headers: HeaderMap,
     axum::Json(body): axum::Json<UpsertSkillBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     if body.name.trim().is_empty() {
@@ -381,7 +382,7 @@ pub async fn get_skill(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     match state.store.get_skill(&id) {
@@ -395,7 +396,7 @@ pub async fn delete_skill(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let deleted = state.store.delete_skill(&id).unwrap_or(false);
@@ -408,7 +409,7 @@ pub async fn execute_skill(
     Path(id): Path<String>,
     body: Option<axum::Json<Value>>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let Ok(Some(sk)) = state.store.get_skill(&id) else {

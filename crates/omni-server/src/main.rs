@@ -1834,4 +1834,95 @@ mod tests {
             .unwrap();
         assert_eq!(st_after["locked"], false);
     }
+
+    #[tokio::test]
+    async fn unlocked_dashboard_management_syncs_while_v1_stays_protected() {
+        let (base, st) = spawn_test_server().await;
+        // Simulate minting an API key via terminal/CLI for an external app (e.g., Hermes)
+        st.store
+            .add_api_key("sk-omni-cli-hermes", "hermes-vps", 1_000)
+            .unwrap();
+        // Record a call log as if Hermes just chatted via /v1/chat/completions
+        let _ = st.store.record_call_log(&omni_store::CallLogRow {
+            id: "log-cli-1".into(),
+            timestamp: "2026-11-25T08:00:00Z".into(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            provider: "agy".into(),
+            connection_id: "agy-1".into(),
+            model: "combo-pecut -> claude-sonnet-4-6".into(),
+            status: 200,
+            duration: 420,
+            tokens_in: 120,
+            tokens_out: 64,
+            error_summary: None,
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. Gateway /v1/* endpoints MUST strictly stay protected (401 without key)
+        let r_chat = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({"model": "combo-pecut", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_chat.status(), 401);
+
+        let r_files = client.get(format!("{base}/v1/files")).send().await.unwrap();
+        assert_eq!(r_files.status(), 401);
+
+        // 2. Unlocked Dashboard /api/* management endpoints MUST remain accessible without manual key paste
+        let r_logs = client.get(format!("{base}/api/logs")).send().await.unwrap();
+        assert_eq!(r_logs.status(), 200);
+        let logs_json: Value = r_logs.json().await.unwrap();
+        assert_eq!(logs_json["count"], 1);
+        assert_eq!(logs_json["logs"][0]["model"], "combo-pecut -> claude-sonnet-4-6");
+
+        let r_keys = client.get(format!("{base}/api/keys")).send().await.unwrap();
+        assert_eq!(r_keys.status(), 200);
+        let keys_json: Value = r_keys.json().await.unwrap();
+        assert_eq!(keys_json["keys"][0]["key"], "sk-omni-cli-hermes");
+
+        let r_analytics = client.get(format!("{base}/api/analytics")).send().await.unwrap();
+        assert_eq!(r_analytics.status(), 200);
+
+        // 3. Once Dashboard Password Lock is enabled, /api/* strictly requires session cookie or API key
+        let setup_r = client
+            .post(format!("{base}/api/auth/setup"))
+            .json(&json!({"password": "dashboard-lock-pw"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(setup_r.status(), 200);
+        let cookie_hdr = setup_r
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let locked_unauth = client.get(format!("{base}/api/logs")).send().await.unwrap();
+        assert_eq!(locked_unauth.status(), 401);
+
+        let locked_cookie = client
+            .get(format!("{base}/api/logs"))
+            .header("Cookie", &cookie_hdr)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(locked_cookie.status(), 200);
+
+        let locked_key = client
+            .get(format!("{base}/api/logs"))
+            .header("Authorization", "Bearer sk-omni-cli-hermes")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(locked_key.status(), 200);
+    }
 }

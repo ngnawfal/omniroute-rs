@@ -22,10 +22,29 @@ export function OptimizationPage({
   onRefresh: () => void;
   onToast: (msg: string, tone?: "success" | "error" | "info") => void;
 }) {
-  const cc = health?.compression?.config || {
+  const cc: any = health?.compression?.config || {
     enabled: false,
     rtk_intensity: "standard",
-    caveman_intensity: "off",
+    caveman_intensity: "lite",
+    preserve_system_prompt: true,
+    preserve_error_tool_results: true,
+    max_lines_per_tool_result: 60,
+    context_budget: {
+      mode: "off",
+      policy: "reserve-output",
+      output_reserve: 8192,
+      safety_margin: 2048,
+      pct: 0.8,
+      absolute_budget: 64000,
+    },
+  };
+  const cb = cc.context_budget || {
+    mode: "off",
+    policy: "reserve-output",
+    output_reserve: 8192,
+    safety_margin: 2048,
+    pct: 0.8,
+    absolute_budget: 64000,
   };
   const cs = health?.compression?.stats || {
     requests_compressed: 0,
@@ -110,11 +129,17 @@ export function OptimizationPage({
                   <div className="text-[11px] text-fg-muted">Compresses verbose build/test logs</div>
                 </div>
                 <SegmentedControl
-                  value={cc.rtk_intensity as "off" | "light" | "standard" | "aggressive"}
+                  value={
+                    (cc.rtk_intensity === "light" ? "minimal" : cc.rtk_intensity) as
+                      | "off"
+                      | "minimal"
+                      | "standard"
+                      | "aggressive"
+                  }
                   onChange={(v) => updateCompression({ rtk_intensity: v })}
                   options={[
                     { value: "off", label: "Off" },
-                    { value: "light", label: "Light" },
+                    { value: "minimal", label: "Minimal" },
                     { value: "standard", label: "Standard" },
                     { value: "aggressive", label: "Aggressive" },
                   ]}
@@ -135,6 +160,83 @@ export function OptimizationPage({
                     { value: "full", label: "Full" },
                     { value: "ultra", label: "Ultra" },
                   ]}
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 py-3">
+                <div>
+                  <div className="text-xs font-semibold text-fg">Adaptive Context Compaction</div>
+                  <div className="text-[11px] text-fg-muted">
+                    Auto-trims oldest middle turns when history exceeds target budget (keeps system prompt + last 4 turns)
+                  </div>
+                </div>
+                <SegmentedControl
+                  value={(cb.mode || "off") as "off" | "floor" | "replace-autotrigger"}
+                  onChange={(mode) =>
+                    updateCompression({
+                      context_budget: { ...cb, mode },
+                    })
+                  }
+                  options={[
+                    { value: "off", label: "Off" },
+                    { value: "floor", label: "Floor" },
+                    { value: "replace-autotrigger", label: "Auto" },
+                  ]}
+                />
+              </div>
+
+              {cb.mode && cb.mode !== "off" && (
+                <div className="flex flex-wrap items-center justify-between gap-3 py-3">
+                  <div>
+                    <div className="text-xs font-semibold text-fg">
+                      Target Context Budget{" "}
+                      <span className="font-mono text-accent-ink">
+                        {cb.policy === "absolute"
+                          ? `${fmtNumber(cb.absolute_budget || 64000)} tok`
+                          : cb.policy === "percentage"
+                          ? `${Math.round((cb.pct || 0.8) * 100)}%`
+                          : `Model − ${fmtNumber((cb.output_reserve || 8192) + (cb.safety_margin || 2048))}`}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-fg-muted">
+                      Policy used to decide when middle turns get compacted
+                    </div>
+                  </div>
+                  <SegmentedControl
+                    value={(cb.policy || "reserve-output") as "reserve-output" | "percentage" | "absolute"}
+                    onChange={(policy) =>
+                      updateCompression({
+                        context_budget: { ...cb, policy },
+                      })
+                    }
+                    options={[
+                      { value: "reserve-output", label: "Reserve" },
+                      { value: "percentage", label: "80%" },
+                      { value: "absolute", label: "64K" },
+                    ]}
+                  />
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-4 py-3">
+                <div>
+                  <div className="text-xs font-semibold text-fg">Preserve System Prompt</div>
+                  <div className="text-[11px] text-fg-muted">Never compress system/developer instructions</div>
+                </div>
+                <Switch
+                  checked={cc.preserve_system_prompt !== false}
+                  onChange={(v) => updateCompression({ preserve_system_prompt: v })}
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4 py-3">
+                <div>
+                  <div className="text-xs font-semibold text-fg">Preserve Error Stack Traces</div>
+                  <div className="text-[11px] text-fg-muted">Keep error tool outputs intact for debugging</div>
+                </div>
+                <Switch
+                  checked={cc.preserve_error_tool_results !== false}
+                  onChange={(v) => updateCompression({ preserve_error_tool_results: v })}
                 />
               </div>
             </div>

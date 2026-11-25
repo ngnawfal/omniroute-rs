@@ -76,9 +76,10 @@ pub fn has_valid_dashboard_session(state: &SharedState, headers: &HeaderMap) -> 
         .unwrap_or(false)
 }
 
-/// Authorizes `/api/*` management calls:
-/// - If dashboard password lock is active: accepts valid session cookie OR valid gateway API key.
-/// - Otherwise: delegates to standard API key authorization (open-door when 0 keys).
+/// Authorizes `/api/*` dashboard management calls:
+/// - If dashboard password lock is active: accepts valid signed HttpOnly session cookie OR valid gateway API key.
+/// - Otherwise (unlocked local/LAN dashboard): allows management UI access directly even after `/v1/*` API keys
+///   have been created for external tools (Hermes, Cursor, CLI), so creating a key never blanks out the Dashboard.
 pub fn authorize_management(state: &SharedState, headers: &HeaderMap) -> Result<(), Response> {
     if state.is_dashboard_locked() {
         if has_valid_dashboard_session(state, headers) {
@@ -98,7 +99,7 @@ pub fn authorize_management(state: &SharedState, headers: &HeaderMap) -> Result<
             }),
         ));
     }
-    authorize_request(state, headers, false).map(|_| ())
+    Ok(())
 }
 
 // ── 1. Upstream Proxies (HTTP/HTTPS/SOCKS5) & Live Tester ───────────

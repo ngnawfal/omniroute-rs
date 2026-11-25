@@ -1,7 +1,7 @@
 // OAuth 2.0 Management API (/api/oauth/*) + Background Token Refresh Scheduler
 // + On-Demand Token & Copilot Minting helpers.
 
-use crate::chat::authorize_request;
+use crate::part_a::authorize_management;
 use crate::state::{now_ms, SharedState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -216,7 +216,7 @@ async fn start_oauth_authorize_inner(
     provider: String,
     req: AuthorizeBody,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let Some(cfg) = find_oauth_provider(&provider) else {
@@ -387,7 +387,7 @@ pub async fn oauth_callback(
     Path(provider): Path<String>,
     axum::Json(body): axum::Json<CallbackBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let Some(cfg) = find_oauth_provider(&provider) else {
@@ -540,7 +540,7 @@ pub async fn oauth_device_poll(
     Path(provider): Path<String>,
     axum::Json(body): axum::Json<PollBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let Some(cfg) = find_oauth_provider(&provider) else {
@@ -708,7 +708,7 @@ pub async fn import_oauth_credential(
     Path(provider): Path<String>,
     axum::Json(body): axum::Json<ImportOAuthBody>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let now = now_ms();
@@ -771,7 +771,7 @@ pub async fn manual_refresh_oauth(
     Path((provider, connection_id)): Path<(String, String)>,
     body: Option<axum::Json<RefreshBody>>,
 ) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     let canonical = find_oauth_provider(&provider)
@@ -1150,7 +1150,7 @@ pub async fn run_oauth_refresh_sweep(state: &SharedState) -> Value {
 }
 
 pub async fn trigger_oauth_sweep(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_request(&state, &headers, false) {
+    if let Err(resp) = authorize_management(&state, &headers) {
         return resp;
     }
     json_status(StatusCode::OK, run_oauth_refresh_sweep(&state).await)

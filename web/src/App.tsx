@@ -29,6 +29,7 @@ import {
   api,
   apiPost,
   getStoredApiKey,
+  setStoredApiKey,
   type ComboItem,
   type CredentialItem,
   type GamificationStatus,
@@ -237,13 +238,25 @@ export default function App() {
     if (m.ok) setMitm(m.data);
     if (gr.ok) setGuardrails(gr.data);
     if (dbRes.ok) setDb(dbRes.data);
-    if (memRes.ok) setMemories(memRes.data?.memories || []);
+    if (memRes.ok) setMemories(memRes.data?.data || memRes.data?.memories || []);
     if (skRes.ok) setSkills(skRes.data?.skills || []);
     if (oaRes.ok) {
       setOAuthProviders(oaRes.data?.providers || []);
       setOAuthStatus(oaRes.data?.status);
     }
-    if (keysRes.ok) setKeys(keysRes.data?.keys || []);
+    if (keysRes.ok) {
+      const list = keysRes.data?.keys || [];
+      setKeys(list);
+      // Auto-sync first active gateway API key into browser localStorage so Playground
+      // & /v1/* tools work immediately even when a key was created from CLI / another browser.
+      if (!getStoredApiKey() && list.length > 0) {
+        const active = list.find((k: any) => !k.disabled && k.key) || list[0];
+        if (active?.key) {
+          setStoredApiKey(active.key);
+          setHasApiKey(true);
+        }
+      }
+    }
     if (credsRes.ok) setCredentials(credsRes.data?.credentials || []);
     if (combosRes.ok) {
       setCombos(combosRes.data?.combos || []);
