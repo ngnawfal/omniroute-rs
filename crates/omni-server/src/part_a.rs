@@ -2027,9 +2027,6 @@ pub fn write_call_log(
         duration: duration_ms,
         tokens_in,
         tokens_out,
-        error_summary: error_summary.map(|s| {
-            let max_len = if s.contains("https://") { 1024 } else { 280 };
-            s.chars().take(max_len).collect()
-        }),
+        error_summary: error_summary.map(|s| s.chars().take(1024).collect()),
     });
 }

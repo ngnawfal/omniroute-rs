@@ -22,6 +22,7 @@ import {
   CheckCircle2,
   XCircle,
   KeyRound,
+  GitBranch,
 } from "lucide-react";
 import {
   Card,
@@ -43,7 +44,15 @@ import { api, apiDelete, apiPost, getStoredApiKey } from "@/lib/api";
 import { cn, copyToClipboard, fmtNum } from "@/lib/utils";
 
 type ActiveTab = "logs" | "analytics" | "budgets";
-type StatusQuickFilter = "" | "2xx" | "429" | "4xx" | "5xx" | "errors";
+type StatusQuickFilter = "" | "2xx" | "429" | "4xx" | "5xx" | "errors" | "combos";
+
+function parseComboRoute(model: string): { combo: string | null; target: string } {
+  const idx = model.indexOf(" -> ");
+  if (idx > 0) {
+    return { combo: model.slice(0, idx).trim(), target: model.slice(idx + 4).trim() };
+  }
+  return { combo: null, target: model };
+}
 
 interface CallLogItem {
   id: string;
@@ -256,7 +265,7 @@ export function AnalyticsLogsPage({
       if (!silent) setLoading(true);
       const params = new URLSearchParams({ limit: String(rowLimit) });
       if (filterProvider.trim()) params.set("provider", filterProvider.trim());
-      if (filterStatus && filterStatus !== "429" && filterStatus !== "errors") {
+      if (filterStatus && filterStatus !== "429" && filterStatus !== "errors" && filterStatus !== "combos") {
         params.set("status", filterStatus);
       }
       if (filterQuery.trim()) params.set("q", filterQuery.trim());
@@ -294,13 +303,16 @@ export function AnalyticsLogsPage({
     return () => window.clearInterval(id);
   }, [liveMode, activeTab, selectedLogId, loadAll]);
 
-  // Client-side refinement for 429 & errors-only quick pills
+  // Client-side refinement for 429, errors-only & combo-routed quick pills
   const displayedLogs = useMemo(() => {
     if (filterStatus === "429") {
       return logs.filter((l) => l.status === 429);
     }
     if (filterStatus === "errors") {
       return logs.filter((l) => l.status < 200 || l.status >= 400);
+    }
+    if (filterStatus === "combos") {
+      return logs.filter((l) => parseComboRoute(l.model).combo !== null || l.provider === "combo");
     }
     return logs;
   }, [logs, filterStatus]);
@@ -352,14 +364,16 @@ export function AnalyticsLogsPage({
     let ok = 0;
     let q429 = 0;
     let err = 0;
+    let combos = 0;
     for (const l of logs) {
+      if (parseComboRoute(l.model).combo !== null || l.provider === "combo") combos++;
       if (l.status >= 200 && l.status < 300) ok++;
       else {
         err++;
         if (l.status === 429) q429++;
       }
     }
-    return { all: logs.length, ok, q429, err };
+    return { all: logs.length, ok, q429, err, combos };
   }, [logs]);
 
   const selectedIndex = useMemo(
@@ -730,6 +744,7 @@ export function AnalyticsLogsPage({
                 {(
                   [
                     { id: "", label: "All", count: batchCounts.all },
+                    { id: "combos", label: "Combos", count: batchCounts.combos },
                     { id: "2xx", label: "2xx Success", count: batchCounts.ok },
                     { id: "errors", label: "Errors Only", count: batchCounts.err },
                     { id: "429", label: "429 Quota", count: batchCounts.q429 },
@@ -787,7 +802,7 @@ export function AnalyticsLogsPage({
                         <th className="px-3 py-2.5 font-semibold">Time</th>
                         <th className="px-3 py-2.5 font-semibold">Status</th>
                         <th className="px-3 py-2.5 font-semibold">Provider &amp; Account</th>
-                        <th className="px-3 py-2.5 font-semibold">Model</th>
+                        <th className="px-3 py-2.5 font-semibold">Route / Model</th>
                         <th className="px-3 py-2.5 font-semibold text-right">Tokens</th>
                         <th className="px-3 py-2.5 font-semibold text-right">Latency</th>
                         <th className="px-3 py-2.5 font-semibold">Diagnostic / Note</th>
@@ -854,13 +869,35 @@ export function AnalyticsLogsPage({
                                 </div>
                               </div>
                             </td>
-                            <td className="px-3 py-2.5 max-w-[240px]">
-                              <span
-                                className="inline-block max-w-full truncate rounded-md border border-border bg-surface-subtle/60 px-1.5 py-0.5 font-mono text-[11px] text-fg"
-                                title={l.model}
-                              >
-                                {l.model}
-                              </span>
+                            <td className="px-3 py-2.5 max-w-[280px]">
+                              {(() => {
+                                const route = parseComboRoute(l.model);
+                                return route.combo ? (
+                                  <div className="flex flex-wrap items-center gap-1">
+                                    <span
+                                      className="inline-flex items-center gap-1 rounded-md border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent-ink"
+                                      title={`Routed via combo "${route.combo}"`}
+                                    >
+                                      <GitBranch className="h-3 w-3 shrink-0" />
+                                      {route.combo}
+                                    </span>
+                                    <span className="text-[10px] text-fg-muted">→</span>
+                                    <span
+                                      className="inline-block max-w-[170px] truncate rounded-md border border-border bg-surface-subtle/60 px-1.5 py-0.5 font-mono text-[11px] text-fg"
+                                      title={route.target}
+                                    >
+                                      {route.target}
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <span
+                                    className="inline-block max-w-full truncate rounded-md border border-border bg-surface-subtle/60 px-1.5 py-0.5 font-mono text-[11px] text-fg"
+                                    title={l.model}
+                                  >
+                                    {l.model}
+                                  </span>
+                                );
+                              })()}
                             </td>
                             <td className="px-3 py-2.5 text-right whitespace-nowrap font-mono text-[11px]">
                               {l.tokens_in > 0 || l.tokens_out > 0 ? (
@@ -1221,6 +1258,12 @@ export function AnalyticsLogsPage({
                 {selectedLog.connection_id && (
                   <Badge variant="default" className="font-mono text-[11px]">
                     acct: {selectedLog.connection_id}
+                  </Badge>
+                )}
+                {parseComboRoute(selectedLog.model).combo && (
+                  <Badge variant="accent" className="font-mono text-[11px] inline-flex items-center gap-1">
+                    <GitBranch className="h-3 w-3" />
+                    combo: {parseComboRoute(selectedLog.model).combo}
                   </Badge>
                 )}
               </div>

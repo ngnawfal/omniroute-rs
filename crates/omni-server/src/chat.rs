@@ -881,6 +881,11 @@ pub(crate) async fn execute_chat_pipeline(
             let extra_resp_headers = prepared.extra_response_headers;
             let latency_ms = started.elapsed().as_millis() as i64;
             let exec_key = candidate.execution_key();
+            let logged_model = if is_combo {
+                format!("{requested_model} -> {}", candidate.model)
+            } else {
+                candidate.model.clone()
+            };
 
             match result {
                 Ok(resp) => {
@@ -919,7 +924,7 @@ pub(crate) async fn execute_chat_pipeline(
                                 status.as_u16(),
                                 &conn.provider,
                                 &conn.connection_id,
-                                &candidate.model,
+                                &logged_model,
                                 latency_ms,
                                 prompt_tokens_est,
                                 0,
@@ -1011,7 +1016,7 @@ pub(crate) async fn execute_chat_pipeline(
                                     status.as_u16(),
                                     &conn.provider,
                                     &conn.connection_id,
-                                    &candidate.model,
+                                    &logged_model,
                                     latency_ms,
                                     pt,
                                     ct,
@@ -1135,7 +1140,7 @@ pub(crate) async fn execute_chat_pipeline(
                             fail.error.status(),
                             &conn.provider,
                             &conn.connection_id,
-                            &candidate.model,
+                            &logged_model,
                             latency_ms,
                             0,
                             0,
@@ -1171,12 +1176,28 @@ pub(crate) async fn execute_chat_pipeline(
 
     match last_failure {
         Some(f) => failure_to_response(&f, is_anthropic),
-        None => format_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "All candidate providers are currently in cooldown",
-            is_anthropic,
-            Some(5_000),
-        ),
+        None => {
+            if !no_log {
+                crate::part_a::write_call_log(
+                    &state,
+                    surface_path,
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    if is_combo { "combo" } else { "gateway" },
+                    "",
+                    &requested_model,
+                    0,
+                    0,
+                    0,
+                    Some("All candidate providers are currently in cooldown".into()),
+                );
+            }
+            format_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "All candidate providers are currently in cooldown",
+                is_anthropic,
+                Some(5_000),
+            )
+        }
     }
 }
 

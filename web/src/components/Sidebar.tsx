@@ -130,20 +130,35 @@ export function Sidebar({
 
   const q = filter.trim().toLowerCase();
 
-  const inner = (
+  const renderInner = (isCollapsed: boolean) => (
     <div className="flex h-full flex-col bg-bg">
       {/* Brand Lockup */}
-      <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-3.5">
+      <div
+        className={cn(
+          "flex h-14 shrink-0 items-center border-b border-border",
+          isCollapsed ? "justify-center px-0" : "justify-between px-3.5"
+        )}
+      >
         <button
           type="button"
           onClick={() => {
-            onSelect("overview");
-            onCloseMobile();
+            if (isCollapsed) {
+              onToggleCollapse();
+            } else {
+              onSelect("overview");
+              onCloseMobile();
+            }
           }}
-          className="flex items-center gap-2.5 overflow-hidden text-left cursor-pointer"
+          title={isCollapsed ? "Expand sidebar" : "OmniRoute RS"}
+          className={cn(
+            "flex items-center overflow-hidden text-left cursor-pointer",
+            isCollapsed
+              ? "h-10 w-10 justify-center rounded-xl hover:bg-surface-subtle transition-colors"
+              : "gap-2.5"
+          )}
         >
           <OmniRouteLogo size={28} />
-          {!collapsed && (
+          {!isCollapsed && (
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
                 <span className="truncate text-sm font-semibold tracking-tight text-fg">
@@ -160,26 +175,30 @@ export function Sidebar({
           )}
         </button>
 
-        <button
-          type="button"
-          onClick={onToggleCollapse}
-          className="hidden h-7 w-7 items-center justify-center rounded-md text-fg-muted hover:bg-surface-subtle hover:text-fg lg:inline-flex cursor-pointer"
-          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        >
-          {collapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
-        </button>
+        {!isCollapsed && (
+          <button
+            type="button"
+            onClick={onToggleCollapse}
+            className="hidden h-7 w-7 items-center justify-center rounded-md text-fg-muted hover:bg-surface-subtle hover:text-fg lg:inline-flex cursor-pointer"
+            title="Collapse sidebar"
+          >
+            <PanelLeftClose className="h-4 w-4" />
+          </button>
+        )}
 
-        <button
-          type="button"
-          onClick={onCloseMobile}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-md text-fg-muted hover:bg-surface-subtle hover:text-fg lg:hidden cursor-pointer"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        {!isCollapsed && (
+          <button
+            type="button"
+            onClick={onCloseMobile}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-md text-fg-muted hover:bg-surface-subtle hover:text-fg lg:hidden cursor-pointer"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        )}
       </div>
 
       {/* Inline Sidebar Filter */}
-      {!collapsed && (
+      {!isCollapsed && (
         <div className="px-3 pt-3 pb-1">
           <div className="relative">
             <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-fg-muted" />
@@ -194,20 +213,28 @@ export function Sidebar({
       )}
 
       {/* Navigation Sections */}
-      <nav className="flex-1 overflow-y-auto px-2.5 py-2 space-y-3">
-        {NAV_SECTIONS.map((section) => {
+      <nav
+        className={cn(
+          "flex-1 overflow-y-auto py-2.5",
+          isCollapsed ? "px-0 space-y-1" : "px-2.5 space-y-3"
+        )}
+      >
+        {NAV_SECTIONS.map((section, sectionIdx) => {
           const visibleItems = section.items.filter(
             (i) =>
+              isCollapsed ||
               !q ||
               i.label.toLowerCase().includes(q) ||
               i.description.toLowerCase().includes(q)
           );
           if (!visibleItems.length) return null;
-          const isGroupClosed = !q && !!closedGroups[section.id];
+          const isGroupClosed = !isCollapsed && !q && !!closedGroups[section.id];
 
           return (
             <div key={section.id}>
-              {!collapsed && (
+              {isCollapsed ? (
+                sectionIdx > 0 && <div className="mx-auto my-2 h-px w-6 bg-border" />
+              ) : (
                 <button
                   type="button"
                   onClick={() => toggleGroup(section.id)}
@@ -223,7 +250,7 @@ export function Sidebar({
               )}
 
               {!isGroupClosed && (
-                <div className="space-y-0.5">
+                <div className={cn(isCollapsed ? "flex flex-col items-center gap-1" : "space-y-0.5")}>
                   {visibleItems.map((item) => {
                     const Icon = item.icon;
                     const active = activeTab === item.id;
@@ -236,17 +263,19 @@ export function Sidebar({
                           onSelect(item.id);
                           onCloseMobile();
                         }}
-                        title={collapsed ? item.label : undefined}
+                        title={isCollapsed ? `${item.label} — ${item.description}` : undefined}
                         className={cn(
-                          "group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-all cursor-pointer",
-                          collapsed && "justify-center px-0",
+                          "group flex items-center text-[13px] font-medium transition-all cursor-pointer",
+                          isCollapsed
+                            ? "h-10 w-10 justify-center rounded-xl p-0"
+                            : "w-full gap-2.5 rounded-lg px-2.5 py-2",
                           active
                             ? "sidebar-active font-semibold"
                             : "text-fg-muted hover:bg-surface-subtle hover:text-fg"
                         )}
                       >
-                        <Icon className="h-4 w-4 shrink-0" />
-                        {!collapsed && (
+                        <Icon className="h-[18px] w-[18px] shrink-0" />
+                        {!isCollapsed && (
                           <>
                             <span className="flex-1 truncate text-left">{item.label}</span>
                             {badge && (
@@ -274,10 +303,28 @@ export function Sidebar({
       </nav>
 
       {/* Gateway Live Status Footer */}
-      <div className="shrink-0 border-t border-border p-3">
-        {collapsed ? (
-          <div className="flex justify-center" title="Gateway Online">
-            <span className="h-2.5 w-2.5 rounded-full bg-success ring-4 ring-success/20" />
+      <div className={cn("shrink-0 border-t border-border", isCollapsed ? "py-2.5 px-0" : "p-3")}>
+        {isCollapsed ? (
+          <div className="flex flex-col items-center gap-2.5">
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-xl text-fg-muted hover:bg-surface-subtle hover:text-fg transition-colors cursor-pointer"
+              title="Expand sidebar"
+            >
+              <PanelLeftOpen className="h-4 w-4" />
+            </button>
+            <div
+              className="flex h-6 w-6 items-center justify-center"
+              title={health ? `Gateway live (${fmtUptime(health.uptime_secs)})` : "Connecting..."}
+            >
+              <span
+                className={cn(
+                  "h-2.5 w-2.5 rounded-full",
+                  health ? "bg-success ring-4 ring-success/20" : "bg-warning"
+                )}
+              />
+            </div>
           </div>
         ) : (
           <div className="flex items-center justify-between rounded-lg border border-border bg-surface px-3 py-2">
@@ -310,7 +357,7 @@ export function Sidebar({
           collapsed ? "w-16" : "w-64"
         )}
       >
-        {inner}
+        {renderInner(collapsed)}
       </aside>
 
       {/* Mobile Drawer */}
@@ -321,7 +368,7 @@ export function Sidebar({
             onClick={onCloseMobile}
           />
           <div className="relative z-10 w-68 max-w-[85vw] border-r border-border shadow-2xl">
-            {inner}
+            {renderInner(false)}
           </div>
         </div>
       )}
