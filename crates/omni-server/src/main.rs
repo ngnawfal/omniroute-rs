@@ -162,10 +162,13 @@ pub fn build_router(app_state: SharedState) -> Router {
         .route("/api/db/import/json", post(api::db_import_json))
         .route("/api/db/import/upstream-sqlite", post(api::db_import_upstream_sqlite))
         .route("/api/db/backup", post(api::db_backup))
-        // Liveness & Embedded Interactive Web Dashboard SPA
+        // Liveness & Embedded Interactive React + Tailwind v4 Web Dashboard SPA
         .route("/healthz", get(|| async { "ok" }))
         .route("/", get(status::status_page))
         .route("/dashboard", get(status::status_page))
+        .route("/favicon.svg", get(status::favicon_asset))
+        .route("/assets/{*path}", get(status::static_asset))
+        .route("/providers/{*path}", get(status::provider_icon_asset))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(app_state)
@@ -1300,7 +1303,7 @@ mod tests {
         let (base, _st) = spawn_test_server().await;
         let client = reqwest::Client::new();
 
-        // 1. Embedded Interactive Web Dashboard served at both / and /dashboard
+        // 1. Embedded Interactive React + Tailwind v4 Web Dashboard served at both / and /dashboard
         for path in ["/", "/dashboard"] {
             let html = client
                 .get(format!("{base}{path}"))
@@ -1310,10 +1313,18 @@ mod tests {
                 .text()
                 .await
                 .unwrap();
-            assert!(html.contains("Native Rust AI Gateway Dashboard"));
-            assert!(html.contains("tab-database"));
-            assert!(html.contains("Live Chat Playground"));
+            assert!(html.contains("OmniRoute"));
+            assert!(html.contains("<div id=\"root\"></div>"));
+            assert!(html.contains("/assets/"));
         }
+        // Verify embedded official upstream SVG provider logo assets
+        let svg_res = client
+            .get(format!("{base}/providers/claude.svg"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(svg_res.status(), reqwest::StatusCode::OK);
+        assert!(svg_res.text().await.unwrap().contains("<svg"));
 
         // 2. Database status & 15-table diagnostics
         let db_st: Value = client
