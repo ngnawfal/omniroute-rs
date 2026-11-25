@@ -36,7 +36,16 @@ pub const ANTHROPIC_BETA_CLAUDE_OAUTH: &str =
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
 pub const ANTHROPIC_SKILLS_BETA: &str = "skills-2025-10-02";
 
+/// Upstream `ANTIGRAVITY_GENERATION_BASE_URLS` (`open-sse/config/antigravityUpstream.ts`):
+/// Free & consumer Antigravity accounts MUST hit `daily-cloudcode-pa.googleapis.com`
+/// (hitting `cloudcode-pa.googleapis.com` directly triggers `403 SUBSCRIPTION_REQUIRED #3501`).
 pub const ANTIGRAVITY_DEFAULT_ENDPOINTS: &[&str] = &[
+    "https://daily-cloudcode-pa.googleapis.com",
+];
+
+/// Upstream `ANTIGRAVITY_DISCOVERY_BASE_URLS` for `v1internal:fetchAvailableModels`.
+pub const ANTIGRAVITY_DISCOVERY_ENDPOINTS: &[&str] = &[
+    "https://daily-cloudcode-pa.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
 ];
@@ -825,17 +834,20 @@ pub fn prepare_provider_request(
                 .get("project_id")
                 .or_else(|| provider_specific.get("projectId"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .unwrap_or("");
-            if !project_id.is_empty() {
+            let is_antigravity = crate::antigravity::is_antigravity_provider(&provider.id);
+            let client_profile =
+                crate::antigravity::resolve_client_profile(&provider.id, provider_specific);
+            // Upstream `antigravityClientProfile.ts`: native Go CLI sends NO x-goog-user-project;
+            // IDE profile sends it only for real non-placeholder project IDs.
+            if !project_id.is_empty()
+                && (!is_antigravity || client_profile != "cli")
+                && !matches!(project_id, "test-project" | "project-id" | "aicode-consumers")
+            {
                 upsert_header(&mut endpoint.extra_headers, "x-goog-user-project", project_id);
             }
             let mut gemini_body = openai_to_gemini(&target_req, stream);
-            let is_antigravity = crate::antigravity::is_antigravity_provider(&provider.id);
-            let op = if stream {
-                "v1internal:streamGenerateContent?alt=sse"
-            } else {
-                "v1internal:generateContent"
-            };
             if is_antigravity {
                 // Protection 1: Native CLI/IDE User-Agent + scrub proxy/SDK/Chromium fingerprint headers
                 let native_ua = crate::antigravity::antigravity_content_user_agent(
@@ -846,6 +858,11 @@ pub fn prepare_provider_request(
                 crate::antigravity::scrub_proxy_and_fingerprint_headers(
                     &mut endpoint.extra_headers,
                 );
+                // Upstream `antigravity.ts:736`: IDE profile always requests `Accept: text/event-stream`;
+                // native Go CLI (`agy`) requests SSE via `?alt=sse` alone with no Accept header.
+                if client_profile != "cli" {
+                    upsert_header(&mut endpoint.extra_headers, "Accept", "text/event-stream");
+                }
 
                 // Protection 2 & 3: Competing-agent prompt sanitizer + UUIDv4 requestId + FNV-1a sessionId + generation defaults
                 crate::antigravity::normalize_antigravity_system_instruction(&mut gemini_body);
@@ -858,6 +875,9 @@ pub fn prepare_provider_request(
                     &identity.session_id,
                 );
 
+                // Upstream `antigravity.ts:717-726`: ALWAYS use `v1internal:streamGenerateContent?alt=sse`
+                // on `daily-cloudcode-pa.googleapis.com` (even for non-streaming clients; gateway
+                // collects SSE into a single OpenAI JSON response when `stream == false`).
                 let uses_default = endpoint.base_urls.is_empty()
                     || endpoint
                         .base_urls
@@ -866,7 +886,7 @@ pub fn prepare_provider_request(
                 if uses_default {
                     endpoint.base_urls = ANTIGRAVITY_DEFAULT_ENDPOINTS
                         .iter()
-                        .map(|b| format!("{b}/{op}"))
+                        .map(|b| format!("{b}/v1internal:streamGenerateContent?alt=sse"))
                         .collect();
                 }
                 let envelope = json!({
@@ -1458,6 +1478,92 @@ mod tests {
         assert_eq!(
             resolve_codex_plan_header(&json!({"plan": "evil\r\ninjection"}), Some(true)),
             None
+        );
+    }
+
+    #[test]
+    fn antigravity_uses_daily_host_always_sse_v255_and_cli_omits_user_project() {
+        let cat = Catalog::with_seed();
+        let ag = cat.find("antigravity").unwrap();
+
+        // IDE profile with real projectId, even when stream=false:
+        let ide_prep = prepare_provider_request(
+            ag,
+            base_endpoint("antigravity", "gemini-2.5-flash", AuthScheme::OAuth),
+            &sample_req("gemini-2.5-flash", false),
+            "gemini-2.5-flash",
+            false,
+            &json!({"projectId": "my-real-gcp-proj", "clientProfile": "ide"}),
+            &[],
+        );
+        // base_endpoint has example.invalid; test default Google host resolution explicitly:
+        let mut google_ep = base_endpoint("antigravity", "gemini-2.5-flash", AuthScheme::OAuth);
+        google_ep.base_urls = vec!["https://cloudcode-pa.googleapis.com".into()];
+        let ide_google = prepare_provider_request(
+            ag,
+            google_ep,
+            &sample_req("gemini-2.5-flash", false),
+            "gemini-2.5-flash",
+            false,
+            &json!({"projectId": "my-real-gcp-proj", "clientProfile": "ide"}),
+            &[],
+        );
+        assert_eq!(
+            ide_google.endpoint.base_urls,
+            vec!["https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"]
+        );
+        assert!(
+            ide_prep
+                .endpoint
+                .extra_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("user-agent") && v == "antigravity/ide/2.5.5 darwin/arm64")
+        );
+        assert!(
+            ide_prep
+                .endpoint
+                .extra_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v == "text/event-stream")
+        );
+        assert!(
+            ide_prep
+                .endpoint
+                .extra_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-goog-user-project") && v == "my-real-gcp-proj")
+        );
+
+        // CLI profile (`agy`): must omit `x-goog-user-project` and `Accept`
+        let agy = cat.find("agy").unwrap();
+        let mut agy_ep = base_endpoint("agy", "gemini-2.5-flash", AuthScheme::OAuth);
+        agy_ep.base_urls = vec!["https://cloudcode-pa.googleapis.com".into()];
+        let cli_prep = prepare_provider_request(
+            agy,
+            agy_ep,
+            &sample_req("gemini-2.5-flash", false),
+            "gemini-2.5-flash",
+            false,
+            &json!({"projectId": "my-real-gcp-proj"}),
+            &[],
+        );
+        assert_eq!(
+            cli_prep.endpoint.base_urls,
+            vec!["https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"]
+        );
+        assert!(
+            !cli_prep
+                .endpoint
+                .extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-goog-user-project"))
+        );
+        assert!(
+            !cli_prep
+                .endpoint
+                .extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
         );
     }
 }

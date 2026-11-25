@@ -1336,7 +1336,7 @@ pub async fn exchange_authorization_code_with_state(
             let ua = if cfg.id == "agy" {
                 "antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=arm64; cl=1003595037; auth_method=consumer)"
             } else {
-                "antigravity/1.4.4 darwin/arm64 google-api-nodejs-client/10.3.0"
+                "antigravity/2.5.5 darwin/arm64 google-api-nodejs-client/10.3.0"
             };
             req = req.header("User-Agent", ua);
         }
@@ -1374,7 +1374,11 @@ fn decode_jwt_payload(jwt: &str) -> Option<Value> {
 }
 
 fn extract_antigravity_project_id(data: &Value) -> Option<String> {
-    let proj = data.get("cloudaicompanionProject")?;
+    // Check both top-level `cloudaicompanionProject` and LRO-nested `response.cloudaicompanionProject`
+    // (mirrors `extractProjectIdFromOnboardResponse` in `antigravityProjectBootstrap.ts`).
+    let proj = data
+        .pointer("/response/cloudaicompanionProject")
+        .or_else(|| data.get("cloudaicompanionProject"))?;
     if let Some(s) = proj.as_str().filter(|s| !s.trim().is_empty()) {
         return Some(s.trim().to_string());
     }
@@ -1413,6 +1417,139 @@ fn extract_antigravity_tier_id(data: &Value) -> String {
     "legacy-tier".to_string()
 }
 
+/// Result of Cloud Code `loadCodeAssist` / `onboardUser` project bootstrap for Antigravity/`agy`.
+#[derive(Debug, Clone, Default)]
+pub struct AntigravityProjectDiscovery {
+    pub project_id: Option<String>,
+    pub tier_id: String,
+    pub requires_manual_project: bool,
+}
+
+/// Discovers (and if needed onboards) a Cloud Code `projectId` for an Antigravity/`agy` OAuth token.
+/// Mirrors upstream `ensureAntigravityProjectAssigned` (`antigravityProjectBootstrap.ts`) including
+/// bounded 5-attempt LRO polling on `onboardUser` when Google replies `{ "done": false }`.
+pub async fn discover_antigravity_project(
+    client: &reqwest::Client,
+    access_token: &str,
+    is_cli: bool,
+) -> AntigravityProjectDiscovery {
+    let load_timeout = Duration::from_secs(8);
+    let onboard_timeout = Duration::from_secs(15);
+    let ua = if is_cli {
+        "antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=arm64; cl=1003595037; auth_method=consumer)"
+    } else {
+        "antigravity/ide/2.5.5 darwin/arm64"
+    };
+    let metadata = if is_cli {
+        json!({ "ideType": "ANTIGRAVITY" })
+    } else {
+        json!({ "ideType": 9, "platform": 4, "pluginType": 2 })
+    };
+    let mut project_id: Option<String> = None;
+    let mut tier_id = "legacy-tier".to_string();
+    let mut requires_manual_project = false;
+
+    let load_url = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+    if let Ok(resp) = client
+        .post(load_url)
+        .timeout(load_timeout)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", ua)
+        .json(&json!({ "metadata": metadata }))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<Value>().await {
+                project_id = extract_antigravity_project_id(&data);
+                tier_id = extract_antigravity_tier_id(&data);
+            }
+        }
+    }
+
+    if project_id.is_none() {
+        let onboard_url = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
+        for attempt in 0..5 {
+            if let Ok(resp) = client
+                .post(onboard_url)
+                .timeout(onboard_timeout)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("User-Agent", ua)
+                .json(&json!({ "tier_id": tier_id, "metadata": metadata }))
+                .send()
+                .await
+            {
+                if !resp.status().is_success() {
+                    break;
+                }
+                if let Ok(ob_data) = resp.json::<Value>().await {
+                    if let Some(pid) = extract_antigravity_project_id(&ob_data) {
+                        project_id = Some(pid);
+                        break;
+                    }
+                    if ob_data.get("done").and_then(Value::as_bool) == Some(false) && attempt < 4 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    // Settled onboardUser with no cloudaicompanionProject -> Google BYOP (#8491)
+                    if ob_data.get("done").and_then(Value::as_bool) != Some(false) {
+                        requires_manual_project = true;
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+        if project_id.is_none() && !requires_manual_project {
+            if let Ok(resp) = client
+                .post(load_url)
+                .timeout(load_timeout)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("User-Agent", ua)
+                .json(&json!({ "metadata": metadata }))
+                .send()
+                .await
+            {
+                if let Ok(data) = resp.json::<Value>().await {
+                    project_id = extract_antigravity_project_id(&data);
+                }
+            }
+        }
+    }
+
+    // If CLI metadata (`{"ideType":"ANTIGRAVITY"}`) returned no project, try IDE enum metadata once
+    // (mirrors live comparison in `antigravityHeaders.ts` where numeric enum metadata succeeds).
+    if project_id.is_none() && is_cli {
+        let ide_ua = "antigravity/ide/2.5.5 darwin/arm64";
+        let ide_meta = json!({ "ideType": 9, "platform": 4, "pluginType": 2 });
+        if let Ok(resp) = client
+            .post(load_url)
+            .timeout(load_timeout)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("User-Agent", ide_ua)
+            .json(&json!({ "metadata": ide_meta }))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(data) = resp.json::<Value>().await {
+                    project_id = extract_antigravity_project_id(&data);
+                    let t = extract_antigravity_tier_id(&data);
+                    if !t.is_empty() && t != "legacy-tier" {
+                        tier_id = t;
+                    }
+                }
+            }
+        }
+    }
+
+    AntigravityProjectDiscovery {
+        project_id,
+        tier_id,
+        requires_manual_project,
+    }
+}
+
 /// Runs best-effort upstream post-exchange account discovery (email, Antigravity Cloud Code
 /// `projectId` via `loadCodeAssist`/`onboardUser`, Codex JWT `workspaceId`, Claude bootstrap,
 /// GitHub `/user`, etc.). Never fails the overall OAuth login if a metadata call times out.
@@ -1448,82 +1585,20 @@ pub async fn run_post_exchange_discovery(
                 }
             }
 
-            // 2. Discover Cloud Code projectId via loadCodeAssist (+ inline onboardUser fallback)
-            let ua = if is_cli {
-                "antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=arm64; cl=1003595037; auth_method=consumer)"
-            } else {
-                "antigravity/1.4.4 darwin/arm64 google-api-nodejs-client/10.3.0"
-            };
-            let metadata = if is_cli {
-                json!({ "ideType": "ANTIGRAVITY" })
-            } else {
-                json!({ "ideType": 9, "platform": 4, "pluginType": 2 })
-            };
-            let mut project_id: Option<String> = None;
-            let mut tier_id = "legacy-tier".to_string();
-
-            let load_url = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-            if let Ok(resp) = client
-                .post(load_url)
-                .timeout(timeout)
-                .header("Authorization", format!("Bearer {}", tok.access_token))
-                .header("User-Agent", ua)
-                .header("X-Goog-Api-Client", "gl-node/22.21.1")
-                .json(&json!({ "metadata": metadata }))
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(data) = resp.json::<Value>().await {
-                        project_id = extract_antigravity_project_id(&data);
-                        tier_id = extract_antigravity_tier_id(&data);
-                    }
-                }
-            }
-
-            if project_id.is_none() {
-                let onboard_url = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
-                if let Ok(resp) = client
-                    .post(onboard_url)
-                    .timeout(timeout)
-                    .header("Authorization", format!("Bearer {}", tok.access_token))
-                    .header("User-Agent", ua)
-                    .header("X-Goog-Api-Client", "gl-node/22.21.1")
-                    .json(&json!({ "tier_id": tier_id, "metadata": metadata }))
-                    .send()
-                    .await
-                {
-                    if let Ok(ob_data) = resp.json::<Value>().await {
-                        project_id = extract_antigravity_project_id(&ob_data);
-                    }
-                }
-                if project_id.is_none() {
-                    if let Ok(resp) = client
-                        .post(load_url)
-                        .timeout(timeout)
-                        .header("Authorization", format!("Bearer {}", tok.access_token))
-                        .header("User-Agent", ua)
-                        .header("X-Goog-Api-Client", "gl-node/22.21.1")
-                        .json(&json!({ "metadata": metadata }))
-                        .send()
-                        .await
-                    {
-                        if let Ok(data) = resp.json::<Value>().await {
-                            project_id = extract_antigravity_project_id(&data);
-                        }
-                    }
-                }
-            }
+            // 2. Discover / onboard Cloud Code projectId via loadCodeAssist + onboardUser
+            let disc = discover_antigravity_project(client, &tok.access_token, is_cli).await;
 
             let mut psj = json!({
                 "clientProfile": if is_cli { "cli" } else { "ide" },
-                "tier": tier_id,
+                "tier": disc.tier_id,
                 "oauthClient": "builtin",
                 "autoSync": true,
             });
-            if let Some(pid) = project_id {
+            if let Some(pid) = disc.project_id {
                 psj["projectId"] = Value::String(pid.clone());
                 psj["project_id"] = Value::String(pid);
+            } else if disc.requires_manual_project {
+                psj["requiresGcpProject"] = Value::Bool(true);
             }
             if let Some(ref em) = meta.email {
                 psj["email"] = Value::String(em.clone());
@@ -2056,11 +2131,19 @@ pub async fn refresh_access_token_once(
         if let Some(secret) = cfg.resolve_client_secret() {
             form.push(("client_secret", secret));
         }
-        client
+        let mut builder = client
             .post(token_url)
             .timeout(Duration::from_millis(DEFAULT_REFRESH_TIMEOUT_MS))
-            .header("Accept", "application/json")
-            .form(&form)
+            .header("Accept", "application/json");
+        if matches!(cfg.id, "antigravity" | "agy") {
+            let ua = if cfg.id == "agy" {
+                "antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=arm64; cl=1003595037; auth_method=consumer)"
+            } else {
+                "antigravity/2.5.5 darwin/arm64 google-api-nodejs-client/10.3.0"
+            };
+            builder = builder.header("User-Agent", ua);
+        }
+        builder.form(&form)
     };
 
     let resp = match req.send().await {

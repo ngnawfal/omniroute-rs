@@ -23,7 +23,7 @@ use omni_exec::antigravity::{
     antigravity_content_user_agent, is_antigravity_provider, scrub_proxy_and_fingerprint_headers,
 };
 use omni_exec::dispatch::validate_proxy_url;
-use omni_exec::executors::{hmac_sha256, ANTIGRAVITY_DEFAULT_ENDPOINTS};
+use omni_exec::executors::{hmac_sha256, ANTIGRAVITY_DISCOVERY_ENDPOINTS};
 use omni_oauth::{
     exchange_copilot_token, GITHUB_COPILOT_API_VERSION, GITHUB_COPILOT_EDITOR_VERSION,
     GITHUB_COPILOT_PLUGIN_VERSION, GITHUB_COPILOT_USER_AGENT,
@@ -591,8 +591,15 @@ async fn probe_antigravity_models_and_quota(
         .and_then(Value::as_str)
         .unwrap_or("");
     let ua = antigravity_content_user_agent(&cred.provider, &cred.provider_specific_json);
+    let is_cli = cred.provider.eq_ignore_ascii_case("agy")
+        || cred
+            .provider_specific_json
+            .get("clientProfile")
+            .and_then(Value::as_str)
+            .map(|s| s.eq_ignore_ascii_case("cli"))
+            .unwrap_or(false);
     let mut hdrs = vec![("User-Agent".to_string(), ua)];
-    if !project_id.is_empty() {
+    if !project_id.is_empty() && !is_cli {
         hdrs.push(("x-goog-user-project".to_string(), project_id.to_string()));
     }
     scrub_proxy_and_fingerprint_headers(&mut hdrs);
@@ -604,7 +611,7 @@ async fn probe_antigravity_models_and_quota(
     };
 
     let mut last_err = String::from("no Antigravity endpoint succeeded");
-    for base in ANTIGRAVITY_DEFAULT_ENDPOINTS {
+    for base in ANTIGRAVITY_DISCOVERY_ENDPOINTS {
         let url = format!("{base}/v1internal:fetchAvailableModels");
         let mut req = client
             .post(&url)

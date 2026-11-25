@@ -13,7 +13,9 @@ use std::sync::{LazyLock, Mutex};
 
 // ── 1. Native User-Agent & Proxy/Fingerprint Header Scrubbing ───────
 
-pub const DEFAULT_ANTIGRAVITY_IDE_VERSION: &str = "1.4.4";
+/// Upstream `ANTIGRAVITY_IDE_FALLBACK_VERSION` (open-sse/services/antigravityVersion.ts).
+/// Cloud Code rejects older IDE versions with 403 SUBSCRIPTION_REQUIRED (#3501) on consumer accounts.
+pub const DEFAULT_ANTIGRAVITY_IDE_VERSION: &str = "2.5.5";
 pub const DEFAULT_ANTIGRAVITY_CLI_VERSION: &str = "1.4.4";
 pub const DEFAULT_ANTIGRAVITY_CLI_CL: &str = "1003595037";
 
@@ -583,7 +585,7 @@ mod tests {
         assert!(cli_ua.contains("cl=1003595037; auth_method=consumer)"));
 
         let ide_ua = antigravity_content_user_agent("antigravity", &json!({}));
-        assert_eq!(ide_ua, "antigravity/ide/1.4.4 darwin/arm64");
+        assert_eq!(ide_ua, "antigravity/ide/2.5.5 darwin/arm64");
 
         let mut hdrs = vec![
             ("User-Agent".into(), cli_ua),

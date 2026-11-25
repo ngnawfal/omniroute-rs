@@ -571,13 +571,43 @@ pub async fn dispatch_once_detailed(
             }
         };
 
-        let status = resp.status().as_u16();
+        let mut status = resp.status().as_u16();
         if (200..300).contains(&status) {
             resilience::record_connection_success(&conn.provider, &conn.connection_id);
             resilience::record_provider_success(&conn.provider);
             resilience::clear_model_lock(&conn.provider, &conn.connection_id, &conn.model);
             return Ok(resp);
         }
+
+        // Upstream `sendAntigravityRequest` (executeAttempt.ts:454): on 403 when
+        // `x-goog-user-project` was sent, transparently retry once without it.
+        let resp = if is_ag
+            && status == 403
+            && conn
+                .extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-goog-user-project"))
+        {
+            let mut stripped_conn = conn.clone();
+            stripped_conn
+                .extra_headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case("x-goog-user-project"));
+            match attempt(dispatcher, url, &stripped_conn, body, stream).await {
+                Ok(retry_resp) => {
+                    status = retry_resp.status().as_u16();
+                    if (200..300).contains(&status) {
+                        resilience::record_connection_success(&conn.provider, &conn.connection_id);
+                        resilience::record_provider_success(&conn.provider);
+                        resilience::clear_model_lock(&conn.provider, &conn.connection_id, &conn.model);
+                        return Ok(retry_resp);
+                    }
+                    retry_resp
+                }
+                Err(_) => resp,
+            }
+        } else {
+            resp
+        };
 
         let header_retry_ms = retry_after_from_header(&resp).map(|d| d.as_millis() as u64);
         let payload = resp.text().await.unwrap_or_default();
@@ -589,7 +619,9 @@ pub async fn dispatch_once_detailed(
         };
 
         let verification_required = is_account_verification_required(status, &payload);
-        let (base_cd, use_backoff) = if verification_required {
+        let ag_actionable_403 = is_ag && is_antigravity_actionable_403(status, &payload);
+        let non_terminal_403 = verification_required || ag_actionable_403;
+        let (base_cd, use_backoff) = if non_terminal_403 {
             (TRANSIENT_INITIAL_MS, false)
         } else {
             classify_cooldown(status, &payload)
@@ -601,18 +633,23 @@ pub async fn dispatch_once_detailed(
         }
 
         // Upstream #14848: Google Cloud Code / Antigravity `403 VALIDATION_REQUIRED`
-        // ("Verify your account to continue") is transient & operator-actionable, NOT a ban.
-        let is_terminal = !verification_required && resilience::is_terminal_status(status);
+        // ("Verify your account to continue") and `403 SUBSCRIPTION_REQUIRED` are
+        // operator-actionable and should not lock out the entire provider breaker.
+        let is_terminal = !non_terminal_403 && resilience::is_terminal_status(status);
         let is_rate_limit = status == 429 || payload.to_ascii_lowercase().contains("rate limit");
 
-        if verification_required {
+        if non_terminal_403 {
             // Brief model-scope cooldown (5s) without tripping the provider breaker so the user
-            // can retry immediately after completing browser verification.
+            // can retry immediately after completing browser verification or updating projectId.
             resilience::lock_model(
                 &conn.provider,
                 &conn.connection_id,
                 &conn.model,
-                "verification_required",
+                if verification_required {
+                    "verification_required"
+                } else {
+                    "subscription_required"
+                },
                 TRANSIENT_INITIAL_MS,
                 1,
             );
@@ -694,6 +731,19 @@ pub fn is_account_verification_required(status: u16, body: &str) -> bool {
         return false;
     }
     lower.contains("verify your account to continue") || lower.contains("validation_required")
+}
+
+/// Google Cloud Code `403 SUBSCRIPTION_REQUIRED` (#3501) on Antigravity is account/project-scoped
+/// and should not trip the provider-wide circuit breaker for other accounts or immediate retries.
+pub fn is_antigravity_actionable_403(status: u16, body: &str) -> bool {
+    if status != 403 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("this service has been disabled in this account for violation") {
+        return false;
+    }
+    lower.contains("subscription_required") || lower.contains("valid license of this product")
 }
 
 pub fn classify_cooldown(status: u16, error_text: &str) -> (u64, bool) {
@@ -945,5 +995,70 @@ mod tests {
         assert_eq!(err2.error.status(), 429);
         assert!(err2.is_local_refusal_replay);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "identical retry must hit 0 upstream requests");
+    }
+
+    #[tokio::test]
+    async fn antigravity_403_retries_once_without_x_goog_user_project() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        resilience::clear_all_lockouts();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let resp = if req_text.contains("x-goog-user-project:") {
+                    let body = r#"{"error":{"code":403,"message":"SUBSCRIPTION_REQUIRED","status":"PERMISSION_DENIED"}}"#;
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body = r#"{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let dispatcher = Dispatcher::new();
+        let conn = ConnectionEndpoint {
+            provider: "antigravity".into(),
+            connection_id: "ag-403-retry".into(),
+            model: "gemini-2.5-flash".into(),
+            auth_type: AuthScheme::OAuth,
+            base_urls: vec![format!("http://127.0.0.1:{port}/v1internal:streamGenerateContent?alt=sse")],
+            api_key: "tok_test".into(),
+            auth_header: AuthHeader::Bearer,
+            auth_prefix: None,
+            extra_headers: vec![("x-goog-user-project".into(), "stale-proj".into())],
+            timeout_ms: Some(5_000),
+            raw_body_override: None,
+            force_gzip: false,
+            proxy_url: None,
+        };
+
+        let resp = dispatch_once_detailed(&dispatcher, &conn, &serde_json::json!({}), false, 0)
+            .await
+            .expect("retry without x-goog-user-project should succeed");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(is_antigravity_actionable_403(
+            403,
+            r#"{"error":{"message":"You do not have a valid license of this product (#3501)","details":[{"reason":"SUBSCRIPTION_REQUIRED"}]}}"#
+        ));
     }
 }

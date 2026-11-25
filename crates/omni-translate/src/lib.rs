@@ -1040,11 +1040,16 @@ pub fn normalize_non_stream_to_openai(
     // Gemini generateContent
     if v.get("candidates").is_some() {
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(Value::as_array) {
             for (idx, p) in parts.iter().enumerate() {
                 if let Some(t) = p.get("text").and_then(Value::as_str) {
-                    text.push_str(t);
+                    if p.get("thought").and_then(Value::as_bool) == Some(true) {
+                        reasoning.push_str(t);
+                    } else {
+                        text.push_str(t);
+                    }
                 }
                 if let Some(fc) = p.get("functionCall").or_else(|| p.get("function_call")) {
                     let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1071,6 +1076,9 @@ pub fn normalize_non_stream_to_openai(
         };
         let (pt, ct, tt, cr, _) = extract_usage_tokens(&v);
         let mut msg = json!({"role": "assistant", "content": text});
+        if !reasoning.is_empty() {
+            msg["reasoning_content"] = json!(reasoning);
+        }
         if !tool_calls.is_empty() {
             msg["tool_calls"] = Value::Array(tool_calls);
         }
@@ -1490,47 +1498,74 @@ pub fn normalize_stream_chunk_to_openai(
         return None;
     }
 
-    // Gemini SSE
+    // Unwrap Antigravity / Cloud Code v1internal SSE envelope (`{"response": {"candidates": [...]}}`)
+    let v = if let Some(inner) = v.get("response") {
+        if inner.get("candidates").is_some() || inner.get("usageMetadata").is_some() {
+            inner.clone()
+        } else {
+            v
+        }
+    } else {
+        v
+    };
+
+    // Gemini / Antigravity SSE
     if v.get("candidates").is_some() || v.get("usageMetadata").is_some() {
-        let c0 = v.pointer("/candidates/0")?;
         let mut delta = json!({});
         let mut tool_calls: Vec<Value> = Vec::new();
-        if let Some(parts) = c0.pointer("/content/parts").and_then(Value::as_array) {
-            let mut text = String::new();
-            for (idx, part) in parts.iter().enumerate() {
-                if let Some(t) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(t);
+        let mut finish_reason: Option<Value> = None;
+        if let Some(c0) = v.pointer("/candidates/0") {
+            if let Some(parts) = c0.pointer("/content/parts").and_then(Value::as_array) {
+                let mut text = String::new();
+                let mut reasoning = String::new();
+                for (idx, part) in parts.iter().enumerate() {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                            reasoning.push_str(t);
+                        } else {
+                            text.push_str(t);
+                        }
+                    }
+                    if let Some(fc) = part.get("functionCall").or_else(|| part.get("function_call")) {
+                        let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
+                        let args = fc.get("args").cloned().unwrap_or(json!({}));
+                        tool_calls.push(json!({
+                            "index": idx,
+                            "id": format!("call_{}_{idx}", short_id()),
+                            "type": "function",
+                            "function": {"name": name, "arguments": args.to_string()}
+                        }));
+                    }
                 }
-                if let Some(fc) = part.get("functionCall").or_else(|| part.get("function_call")) {
-                    let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
-                    let args = fc.get("args").cloned().unwrap_or(json!({}));
-                    tool_calls.push(json!({
-                        "index": idx,
-                        "id": format!("call_{}_{idx}", short_id()),
-                        "type": "function",
-                        "function": {"name": name, "arguments": args.to_string()}
-                    }));
+                if !text.is_empty() {
+                    delta["content"] = json!(text);
+                }
+                if !reasoning.is_empty() {
+                    delta["reasoning_content"] = json!(reasoning);
+                }
+                if !tool_calls.is_empty() {
+                    delta["tool_calls"] = Value::Array(tool_calls);
                 }
             }
-            if !text.is_empty() {
-                delta["content"] = json!(text);
-            }
-            if !tool_calls.is_empty() {
-                delta["tool_calls"] = Value::Array(tool_calls);
-            }
+            finish_reason = c0.get("finishReason").and_then(Value::as_str).map(|fr| {
+                if delta.get("tool_calls").is_some() {
+                    json!("tool_calls")
+                } else if fr == "STOP" {
+                    json!("stop")
+                } else if fr == "MAX_TOKENS" {
+                    json!("length")
+                } else {
+                    json!(fr.to_ascii_lowercase())
+                }
+            });
         }
-        let finish_reason = c0.get("finishReason").and_then(Value::as_str).map(|fr| {
-            if delta.get("tool_calls").is_some() {
-                json!("tool_calls")
-            } else if fr == "STOP" {
-                json!("stop")
-            } else if fr == "MAX_TOKENS" {
-                json!("length")
-            } else {
-                json!(fr.to_ascii_lowercase())
-            }
-        });
-        let (pt, ct, tt, _, _) = extract_usage_tokens(&v);
+        let (pt, ct, tt, cr, _) = extract_usage_tokens(&v);
+        if delta.as_object().map(|o| o.is_empty()).unwrap_or(true)
+            && finish_reason.is_none()
+            && tt == 0
+        {
+            return None;
+        }
         let mut chunk = json!({
             "id": format!("chatcmpl-{}", short_id()),
             "object": "chat.completion.chunk",
@@ -1539,12 +1574,140 @@ pub fn normalize_stream_chunk_to_openai(
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason.unwrap_or(Value::Null)}]
         });
         if tt > 0 {
-            chunk["usage"] = json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt});
+            chunk["usage"] = json!({
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": tt,
+                "prompt_tokens_details": {"cached_tokens": cr}
+            });
         }
         return Some(chunk);
     }
 
     Some(v)
+}
+
+/// Collects an upstream SSE stream (e.g., Antigravity `v1internal:streamGenerateContent?alt=sse`
+/// when a client requests `stream: false`) into a single canonical OpenAI ChatCompletion JSON.
+pub fn collect_sse_chunks_to_openai(
+    provider: &str,
+    model: &str,
+    sse_bytes: &[u8],
+    tool_name_map: &[(String, String)],
+) -> Value {
+    let mut assembler = omni_types::sse::SseAssembler::new();
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut finish_reason = "stop".to_string();
+    let mut pt: i64 = 0;
+    let mut ct: i64 = 0;
+    let mut tt: i64 = 0;
+    let mut cr: i64 = 0;
+    let mut completion_id: Option<String> = None;
+
+    let text = String::from_utf8_lossy(sse_bytes);
+    for line in text.lines().chain(std::iter::once("")) {
+        if let Some(frame) = assembler.feed_line(line.trim_end()) {
+            if frame.done {
+                continue;
+            }
+            let event = frame.event.as_deref().unwrap_or("");
+            let upstream = serde_json::from_str::<Value>(&frame.data).ok();
+            let Some(chunk) =
+                normalize_stream_chunk_to_openai(provider, model, event, upstream, tool_name_map)
+            else {
+                continue;
+            };
+            if completion_id.is_none() {
+                if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+                    completion_id = Some(id.to_string());
+                }
+            }
+            if let Some(choice) = chunk.pointer("/choices/0") {
+                if let Some(delta) = choice.get("delta") {
+                    if let Some(c) = delta.get("content").and_then(Value::as_str) {
+                        content.push_str(c);
+                    }
+                    if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+                        reasoning.push_str(r);
+                    }
+                    if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                        for tc in tcs {
+                            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(tool_calls.len() as u64) as usize;
+                            if idx >= tool_calls.len() {
+                                tool_calls.resize_with(idx + 1, || {
+                                    json!({
+                                        "id": format!("call_{}_{idx}", short_id()),
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""}
+                                    })
+                                });
+                            }
+                            if let Some(id) = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                tool_calls[idx]["id"] = json!(id);
+                            }
+                            if let Some(name) = tc.pointer("/function/name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                tool_calls[idx]["function"]["name"] = json!(name);
+                            }
+                            if let Some(args) = tc.pointer("/function/arguments").and_then(Value::as_str) {
+                                let prev = tool_calls[idx]
+                                    .pointer("/function/arguments")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                tool_calls[idx]["function"]["arguments"] = json!(format!("{prev}{args}"));
+                            }
+                        }
+                    }
+                }
+                if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                    if !fr.is_empty() {
+                        finish_reason = fr.to_string();
+                    }
+                }
+            }
+            let (upt, uct, utt, ucr, _) = extract_usage_tokens(&chunk);
+            if upt > 0 {
+                pt = upt;
+            }
+            if uct > 0 {
+                ct = uct;
+            }
+            if utt > 0 {
+                tt = utt;
+            }
+            if ucr > 0 {
+                cr = ucr;
+            }
+        }
+    }
+    if tt == 0 {
+        tt = pt + ct;
+    }
+    if !tool_calls.is_empty() {
+        finish_reason = "tool_calls".into();
+    }
+    let mut msg = json!({"role": "assistant", "content": content});
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    if !tool_calls.is_empty() {
+        msg["tool_calls"] = Value::Array(tool_calls);
+    }
+    json!({
+        "id": completion_id.unwrap_or_else(|| format!("chatcmpl-{}", short_id())),
+        "object": "chat.completion",
+        "created": now_unix_secs(),
+        "model": model,
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": tt,
+            "prompt_tokens_details": {"cached_tokens": cr}
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1685,5 +1848,22 @@ mod tests {
         assert_eq!(out["contents"][0]["role"], "user");
         assert_eq!(out["contents"][0]["parts"][0]["text"], "hello");
         assert_eq!(out["system_instruction"]["parts"][0]["text"], "s");
+    }
+
+    #[test]
+    fn antigravity_sse_envelope_collects_into_openai_completion() {
+        let sse = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true}]}}]}}\n\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Halo \"}]}}]}}\n\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"dunia!\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":5,\"totalTokenCount\":17}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let oai = collect_sse_chunks_to_openai("antigravity", "gemini-2.5-flash", sse.as_bytes(), &[]);
+        assert_eq!(oai["choices"][0]["message"]["content"], "Halo dunia!");
+        assert_eq!(oai["choices"][0]["message"]["reasoning_content"], "thinking...");
+        assert_eq!(oai["choices"][0]["finish_reason"], "stop");
+        assert_eq!(oai["usage"]["prompt_tokens"], 12);
+        assert_eq!(oai["usage"]["completion_tokens"], 5);
+        assert_eq!(oai["usage"]["total_tokens"], 17);
     }
 }

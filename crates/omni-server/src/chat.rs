@@ -37,10 +37,11 @@ use omni_router::{
 };
 use omni_store::{CredentialRow, UsageEntry};
 use omni_translate::{
-    claude_to_openai_request, extract_usage_tokens, normalize_non_stream_to_openai,
-    normalize_stream_chunk_to_openai, openai_chat_to_legacy_completion, openai_chunk_to_gemini_sse,
-    openai_to_claude_response, openai_to_gemini_response, openai_to_responses_response,
-    OpenAiToClaudeStreamState, OpenAiToResponsesStreamState,
+    claude_to_openai_request, collect_sse_chunks_to_openai, extract_usage_tokens,
+    normalize_non_stream_to_openai, normalize_stream_chunk_to_openai,
+    openai_chat_to_legacy_completion, openai_chunk_to_gemini_sse, openai_to_claude_response,
+    openai_to_gemini_response, openai_to_responses_response, OpenAiToClaudeStreamState,
+    OpenAiToResponsesStreamState,
 };
 use omni_types::errors::{
     build_anthropic_error_body, build_error_body, build_error_body_with_retry,
@@ -944,11 +945,32 @@ pub(crate) async fn execute_chat_pipeline(
                         .await;
                     }
 
+                    let resp_is_sse = resp
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
+                        .unwrap_or(false);
+
                     match resp.bytes().await {
                         Ok(bytes) => {
-                            let v: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-                                json!({"raw": String::from_utf8_lossy(&bytes).to_string()})
-                            });
+                            let looks_like_sse = resp_is_sse || {
+                                let trimmed = String::from_utf8_lossy(&bytes);
+                                let s = trimmed.trim_start();
+                                s.starts_with("data:") || s.starts_with("event:")
+                            };
+                            let v: Value = if looks_like_sse {
+                                collect_sse_chunks_to_openai(
+                                    &conn.provider,
+                                    &candidate.model,
+                                    &bytes,
+                                    &tool_name_map,
+                                )
+                            } else {
+                                serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                                    json!({"raw": String::from_utf8_lossy(&bytes).to_string()})
+                                })
+                            };
                             let (pt, ct, tt, cr, cw) = if upstream_resp_fmt
                                 == UpstreamResponseFormat::BedrockConverse
                             {

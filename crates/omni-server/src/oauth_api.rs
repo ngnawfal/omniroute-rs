@@ -928,6 +928,7 @@ pub async fn refresh_credential_now(
             next.expires_at = expires_at;
             next.health_status = "healthy".into();
             next.last_refreshed_at = Some(now);
+            maybe_bootstrap_antigravity_project(state, &mut next, now).await;
             Ok(next)
         }
         RefreshOutcome::Unrecoverable(msg) => {
@@ -950,8 +951,90 @@ pub async fn refresh_credential_now(
     }
 }
 
+/// Short-lived per-connection cooldown (60s) so an Antigravity account whose
+/// `loadCodeAssist` returned no project doesn't re-run bootstrap on every request.
+static ANTIGRAVITY_PROJECT_RETRY_COOLDOWN: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, i64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+async fn maybe_bootstrap_antigravity_project(
+    state: &SharedState,
+    cred: &mut CredentialRow,
+    now: i64,
+) {
+    if !matches!(cred.provider.as_str(), "antigravity" | "agy" | "gemini-cli") {
+        return;
+    }
+    if cred.api_key.is_empty() {
+        return;
+    }
+    // Skip external Google API calls during localhost mock tests
+    if cred.base_urls.iter().any(|u| u.contains("127.0.0.1") || u.contains("localhost"))
+        || cred.provider_specific_json.get("token_url").is_some()
+    {
+        return;
+    }
+    let has_project = cred
+        .provider_specific_json
+        .get("projectId")
+        .or_else(|| cred.provider_specific_json.get("project_id"))
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_project {
+        return;
+    }
+
+    let key = format!("{}::{}", cred.provider, cred.connection_id);
+    if let Ok(guard) = ANTIGRAVITY_PROJECT_RETRY_COOLDOWN.lock() {
+        if let Some(&until) = guard.get(&key) {
+            if until > now {
+                return;
+            }
+        }
+    }
+
+    let is_cli = cred.provider == "agy"
+        || cred
+            .provider_specific_json
+            .get("clientProfile")
+            .and_then(Value::as_str)
+            .map(|s| s.eq_ignore_ascii_case("cli"))
+            .unwrap_or(false);
+    let client = state.oauth_http_client_for(&cred.provider, Some(cred));
+    let disc = omni_oauth::discover_antigravity_project(&client, &cred.api_key, is_cli).await;
+    if let Some(pid) = disc.project_id {
+        if !cred.provider_specific_json.is_object() {
+            cred.provider_specific_json = json!({});
+        }
+        cred.provider_specific_json["projectId"] = Value::String(pid.clone());
+        cred.provider_specific_json["project_id"] = Value::String(pid.clone());
+        if !disc.tier_id.is_empty() {
+            cred.provider_specific_json["tier"] = Value::String(disc.tier_id);
+        }
+        if let Some(obj) = cred.provider_specific_json.as_object_mut() {
+            obj.remove("requiresGcpProject");
+        }
+        let _ = state.store.upsert_credential_full(cred);
+        if let Ok(mut guard) = ANTIGRAVITY_PROJECT_RETRY_COOLDOWN.lock() {
+            guard.remove(&key);
+        }
+        tracing::info!(
+            provider = %cred.provider,
+            connection_id = %cred.connection_id,
+            project_id = %pid,
+            "Auto-discovered and persisted Antigravity Cloud Code projectId"
+        );
+    } else if let Ok(mut guard) = ANTIGRAVITY_PROJECT_RETRY_COOLDOWN.lock() {
+        if guard.len() > 256 {
+            guard.retain(|_, &mut v| v > now);
+        }
+        guard.insert(key, now + 60_000);
+    }
+}
+
 /// Called on the hot request path before dispatch: refreshes an OAuth or Copilot token
-/// if it is within 60 seconds of expiry.
+/// if it is within 60 seconds of expiry, and auto-bootstraps missing Antigravity `projectId`.
 pub async fn ensure_fresh_oauth_credential(
     state: &SharedState,
     cred: &CredentialRow,
@@ -982,12 +1065,19 @@ pub async fn ensure_fresh_oauth_credential(
         .expires_at
         .map(|exp| exp <= now + ON_DEMAND_EXPIRY_BUFFER_MS)
         .unwrap_or(false);
-    if expiring && cred.refresh_token.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
-        if let Ok(fresh) = refresh_credential_now(state, cred, None, None).await {
-            return fresh;
+    let mut active = if expiring
+        && cred.refresh_token.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+    {
+        match refresh_credential_now(state, cred, None, None).await {
+            Ok(fresh) => fresh,
+            Err(_) => cred.clone(),
         }
-    }
-    cred.clone()
+    } else {
+        cred.clone()
+    };
+
+    maybe_bootstrap_antigravity_project(state, &mut active, now).await;
+    active
 }
 
 // ── Background Refresh Sweep + Scheduler ────────────────────────────
