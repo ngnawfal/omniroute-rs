@@ -4,14 +4,15 @@
 use crate::chat::authorize_request;
 use crate::state::{now_ms, SharedState};
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use omni_oauth::{
-    build_authorize_url, exchange_authorization_code, exchange_copilot_token, find_oauth_provider,
-    generate_pkce, healthcheck_per_provider_concurrency, healthcheck_skip_providers,
-    is_healthcheck_disabled, poll_device_code, refresh_with_retry, start_device_code,
-    DevicePollOutcome, OAuthFlowKind, PendingOAuthSession, RefreshOutcome, OAUTH_PROVIDERS,
+    build_authorize_url, exchange_authorization_code_with_state, exchange_copilot_token,
+    find_oauth_provider, generate_pkce, healthcheck_per_provider_concurrency,
+    healthcheck_skip_providers, is_healthcheck_disabled, parse_callback_input, poll_device_code,
+    refresh_with_retry, run_post_exchange_discovery, start_device_code, DevicePollOutcome,
+    OAuthFlowKind, PendingOAuthSession, RefreshOutcome, OAUTH_PROVIDERS,
 };
 use omni_store::CredentialRow;
 use serde::Deserialize;
@@ -33,6 +34,116 @@ fn json_status(status: StatusCode, body: Value) -> Response {
         .unwrap()
 }
 
+// ── GET /callback & /auth/callback (Browser Popup Relay Page) ───────
+
+const OAUTH_CALLBACK_RELAY_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OmniRoute OAuth Callback</title>
+<style>
+  :root{--bg:#071013;--card:#0e1c20;--border:#1e353c;--text:#eef3f4;--muted:#93aab0;--accent:#d8ff00;--ok:#34d399;--warn:#fbbf24}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,sans-serif}
+  .card{width:100%;max-width:480px;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:28px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+  .ico{width:52px;height:52px;margin:0 auto 14px;border-radius:50%;display:grid;place-items:center;font-size:24px;font-weight:700;background:rgba(216,255,0,.12);color:var(--accent);border:1px solid rgba(216,255,0,.35)}
+  .ico.ok{background:rgba(52,211,153,.14);color:var(--ok);border-color:rgba(52,211,153,.4)}
+  h1{margin:0 0 8px;font-size:19px;font-weight:650;letter-spacing:-.01em}
+  p{margin:0 0 16px;font-size:13.5px;color:var(--muted);line-height:1.5}
+  .url-box{background:#091417;border:1px solid var(--border);border-radius:10px;padding:12px;text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:#d6e3e6;word-break:break-all;margin-bottom:14px;max-height:140px;overflow:auto}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 16px;border-radius:9px;border:1px solid var(--accent);background:var(--accent);color:#071013;font-weight:650;font-size:13px;cursor:pointer;width:100%}
+  .btn:hover{filter:brightness(1.06)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="ico" id="ico">...</div>
+    <h1 id="title">Processing OAuth callback</h1>
+    <p id="desc">Relaying authorization response back to OmniRoute dashboard...</p>
+    <div id="manual" style="display:none">
+      <div class="url-box" id="url-box"></div>
+      <button class="btn" id="copy-btn" onclick="copyCallbackUrl()">Copy full callback URL</button>
+    </div>
+  </div>
+<script>
+(function(){
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  const state = params.get('state');
+  const error = params.get('error');
+  const errorDescription = params.get('error_description');
+  const fullUrl = window.location.href;
+  const callbackData = { code, state, error, errorDescription, fullUrl };
+  let sent = false;
+  let openerSameOrigin = false;
+
+  if (window.opener) {
+    try { openerSameOrigin = window.opener.location.origin === window.location.origin; } catch {}
+    const targets = [
+      window.location.origin,
+      ...(window.location.port ? ['http://localhost:' + window.location.port, 'http://127.0.0.1:' + window.location.port] : []),
+      'http://localhost:1455',
+      'http://127.0.0.1:1455'
+    ];
+    for (const origin of targets) {
+      try { window.opener.postMessage({ type: 'oauth_callback', data: callbackData }, origin); sent = true; } catch {}
+    }
+  }
+  try {
+    const ch = new BroadcastChannel('oauth_callback');
+    ch.postMessage(callbackData);
+    ch.close();
+    sent = true;
+  } catch {}
+  try {
+    localStorage.setItem('oauth_callback', JSON.stringify({ ...callbackData, timestamp: Date.now() }));
+    sent = true;
+  } catch {}
+
+  const ico = document.getElementById('ico');
+  const title = document.getElementById('title');
+  const desc = document.getElementById('desc');
+  const manual = document.getElementById('manual');
+  const urlBox = document.getElementById('url-box');
+
+  if (sent && (code || error) && window.opener && openerSameOrigin) {
+    ico.textContent = '✓';
+    ico.className = 'ico ok';
+    title.textContent = error ? 'Authorization error received' : 'Authorization successful';
+    desc.textContent = 'Returning to OmniRoute dashboard... this window will close automatically.';
+    setTimeout(() => {
+      window.close();
+      setTimeout(() => { desc.textContent = 'You can close this tab now and return to OmniRoute.'; }, 500);
+    }, 1000);
+  } else {
+    ico.textContent = '↗';
+    title.textContent = code ? 'Copy this callback URL into OmniRoute' : 'Manual callback fallback';
+    desc.textContent = 'Paste this full URL into the OmniRoute OAuth login dialog to complete authentication.';
+    urlBox.textContent = fullUrl;
+    manual.style.display = 'block';
+  }
+  window.copyCallbackUrl = async function() {
+    try {
+      await navigator.clipboard.writeText(fullUrl);
+      document.getElementById('copy-btn').textContent = 'Copied! Paste into OmniRoute';
+    } catch {
+      document.getElementById('copy-btn').textContent = 'Select and copy the URL above';
+    }
+  };
+})();
+</script>
+</body>
+</html>"#;
+
+pub async fn oauth_callback_relay_page() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(OAUTH_CALLBACK_RELAY_HTML))
+        .unwrap()
+}
+
 // ── GET /api/oauth/providers ────────────────────────────────────────
 
 pub async fn list_oauth_providers(State(state): State<SharedState>) -> Response {
@@ -47,8 +158,12 @@ pub async fn list_oauth_providers(State(state): State<SharedState>) -> Response 
                 "authorize_url": p.authorize_url,
                 "device_code_url": p.device_code_url,
                 "default_redirect_uri": p.default_redirect_uri(),
+                "loopback_host": p.loopback_host,
+                "loopback_port": p.loopback_port,
+                "callback_path": p.callback_path,
+                "fixed_redirect_uri": p.fixed_redirect_uri,
                 "scopes": p.scopes,
-                "client_id_configured": !p.resolve_client_id().is_empty(),
+                "client_id_configured": !p.resolve_client_id().is_empty() || matches!(p.id, "cline" | "devin-desktop"),
             })
         })
         .collect();
@@ -61,15 +176,29 @@ pub async fn list_oauth_providers(State(state): State<SharedState>) -> Response 
     )
 }
 
-// ── POST /api/oauth/{provider}/authorize ────────────────────────────
+// ── GET & POST /api/oauth/{provider}/authorize (and GET /device-code) ──
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AuthorizeBody {
+    #[serde(alias = "connectionId")]
     pub connection_id: Option<String>,
+    #[serde(alias = "redirectUri")]
     pub redirect_uri: Option<String>,
+    #[serde(alias = "clientId")]
     pub client_id: Option<String>,
+    #[serde(alias = "tokenUrl")]
     pub token_url: Option<String>,
+    #[serde(alias = "deviceCodeUrl")]
     pub device_code_url: Option<String>,
+}
+
+pub async fn start_oauth_authorize_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+    Query(query): Query<AuthorizeBody>,
+) -> Response {
+    start_oauth_authorize_inner(state, headers, provider, query).await
 }
 
 pub async fn start_oauth_authorize(
@@ -77,6 +206,15 @@ pub async fn start_oauth_authorize(
     headers: HeaderMap,
     Path(provider): Path<String>,
     body: Option<axum::Json<AuthorizeBody>>,
+) -> Response {
+    start_oauth_authorize_inner(state, headers, provider, body.map(|b| b.0).unwrap_or_default()).await
+}
+
+async fn start_oauth_authorize_inner(
+    state: SharedState,
+    headers: HeaderMap,
+    provider: String,
+    req: AuthorizeBody,
 ) -> Response {
     if let Err(resp) = authorize_request(&state, &headers, false) {
         return resp;
@@ -87,7 +225,6 @@ pub async fn start_oauth_authorize(
             json!({"error": format!("unsupported OAuth provider: {provider}")}),
         );
     };
-    let req = body.map(|b| b.0).unwrap_or_default();
     let conn_id = req
         .connection_id
         .filter(|s| !s.trim().is_empty())
@@ -96,13 +233,33 @@ pub async fn start_oauth_authorize(
 
     match cfg.flow {
         OAuthFlowKind::Pkce => {
-            let pkce = generate_pkce();
-            let redirect_uri = req
-                .redirect_uri
+            let resolved_cid = req
+                .client_id
+                .as_deref()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| cfg.default_redirect_uri());
+                .map(String::from)
+                .unwrap_or_else(|| cfg.resolve_client_id());
+            if resolved_cid.is_empty() && !matches!(cfg.id, "cline" | "devin-desktop") {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!(
+                            "Provider '{}' requires {} environment variable to be configured (or pass client_id).",
+                            cfg.id, cfg.client_id_env
+                        )
+                    }),
+                );
+            }
+            let pkce = generate_pkce();
+            let redirect_uri = if cfg.id == "claude" {
+                cfg.default_redirect_uri()
+            } else {
+                req.redirect_uri
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| cfg.default_redirect_uri())
+            };
             let authorize_url =
-                build_authorize_url(cfg, &redirect_uri, &pkce, req.client_id.as_deref(), &[]);
+                build_authorize_url(cfg, &redirect_uri, &pkce, Some(&resolved_cid), &[]);
             state.oauth_sessions.insert(
                 PendingOAuthSession {
                     state: pkce.state.clone(),
@@ -110,7 +267,7 @@ pub async fn start_oauth_authorize(
                     connection_id: conn_id.clone(),
                     redirect_uri: redirect_uri.clone(),
                     code_verifier: pkce.code_verifier.clone(),
-                    client_id: req.client_id.unwrap_or_else(|| cfg.resolve_client_id()),
+                    client_id: resolved_cid,
                     token_url_override: req.token_url,
                     device_code: None,
                     created_at_ms: now,
@@ -124,10 +281,14 @@ pub async fn start_oauth_authorize(
                     "provider": cfg.id,
                     "connection_id": conn_id,
                     "authorize_url": authorize_url,
+                    "authUrl": authorize_url,
                     "state": pkce.state,
+                    "code_verifier": pkce.code_verifier,
+                    "codeVerifier": pkce.code_verifier,
                     "code_challenge": pkce.code_challenge,
                     "code_challenge_method": pkce.code_challenge_method,
                     "redirect_uri": redirect_uri,
+                    "redirectUri": redirect_uri,
                 }),
             )
         }
@@ -182,25 +343,42 @@ pub async fn start_oauth_authorize(
                 "provider": cfg.id,
                 "connection_id": conn_id,
                 "authorize_url": cfg.authorize_url,
+                "authUrl": cfg.authorize_url,
                 "import_endpoint": format!("/api/oauth/{}/import", cfg.id),
             }),
         ),
     }
 }
 
-// ── POST /api/oauth/{provider}/callback ─────────────────────────────
+// ── POST /api/oauth/{provider}/callback & /exchange ─────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct CallbackBody {
+    #[serde(default, alias = "callbackUrl", alias = "callback_url")]
     pub code: String,
     pub state: Option<String>,
+    #[serde(alias = "connectionId")]
     pub connection_id: Option<String>,
+    #[serde(alias = "redirectUri")]
     pub redirect_uri: Option<String>,
+    #[serde(alias = "codeVerifier")]
     pub code_verifier: Option<String>,
+    #[serde(alias = "clientId")]
     pub client_id: Option<String>,
+    #[serde(alias = "tokenUrl")]
     pub token_url: Option<String>,
     pub label: Option<String>,
     pub provider_specific_json: Option<Value>,
+}
+
+fn merge_json_objects(base: &mut Value, extra: Value) {
+    if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            if !v.is_null() && !b.contains_key(k) {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+    }
 }
 
 pub async fn oauth_callback(
@@ -218,36 +396,47 @@ pub async fn oauth_callback(
             json!({"error": format!("unsupported OAuth provider: {provider}")}),
         );
     };
+
+    // Parse full callback URL, Claude `code#state`, or raw code before session lookup
+    let (parsed_code, parsed_state) = match parse_callback_input(&body.code, body.state.as_deref()) {
+        Ok(pair) => pair,
+        Err(e) => return json_status(StatusCode::BAD_REQUEST, json!({"error": e})),
+    };
+
     let now = now_ms();
-    let session = body
-        .state
-        .as_deref()
-        .and_then(|s| state.oauth_sessions.take(s, now));
+    let effective_state = parsed_state.as_deref().or(body.state.as_deref());
+    let session = effective_state.and_then(|s| state.oauth_sessions.take(s, now));
 
     let redirect_uri = body
         .redirect_uri
+        .filter(|s| !s.is_empty())
         .or_else(|| session.as_ref().map(|s| s.redirect_uri.clone()))
         .unwrap_or_else(|| cfg.default_redirect_uri());
     let code_verifier = body
         .code_verifier
+        .filter(|s| !s.is_empty())
         .or_else(|| session.as_ref().map(|s| s.code_verifier.clone()));
     let client_id = body
         .client_id
+        .filter(|s| !s.is_empty())
         .or_else(|| session.as_ref().map(|s| s.client_id.clone()));
     let token_url = body
         .token_url
+        .filter(|s| !s.is_empty())
         .or_else(|| session.as_ref().and_then(|s| s.token_url_override.clone()));
     let connection_id = body
         .connection_id
+        .filter(|s| !s.is_empty())
         .or_else(|| session.as_ref().map(|s| s.connection_id.clone()))
         .unwrap_or_else(|| format!("{}-default", cfg.id));
 
-    match exchange_authorization_code(
+    match exchange_authorization_code_with_state(
         &state.dispatcher.client,
         cfg,
-        &body.code,
+        &parsed_code,
         &redirect_uri,
         code_verifier.as_deref(),
+        effective_state,
         client_id.as_deref(),
         token_url.as_deref(),
     )
@@ -263,7 +452,26 @@ pub async fn oauth_callback(
                     psj["client_id"] = Value::String(cid.clone());
                 }
             }
+            // Skip external post-exchange HTTP calls when a custom mock token_url is used in tests
+            let meta = if token_url.is_none() {
+                run_post_exchange_discovery(&state.dispatcher.client, cfg, &tok).await
+            } else {
+                Default::default()
+            };
+            merge_json_objects(&mut psj, meta.provider_specific);
+
+            let label = body
+                .label
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| meta.email.clone())
+                .or_else(|| meta.display_name.clone())
+                .unwrap_or_else(|| cfg.display_name.to_string());
             let expires_at = tok.expires_at_ms(now);
+            let project_id = psj
+                .get("projectId")
+                .or_else(|| psj.get("project_id"))
+                .and_then(Value::as_str)
+                .map(String::from);
             let row = CredentialRow {
                 provider: cfg.id.to_string(),
                 connection_id: connection_id.clone(),
@@ -274,7 +482,7 @@ pub async fn oauth_callback(
                 enabled: true,
                 priority: 0,
                 weight: 1.0,
-                label: body.label.unwrap_or_else(|| cfg.display_name.to_string()),
+                label: label.clone(),
                 refresh_token: tok.refresh_token,
                 expires_at,
                 provider_specific_json: psj,
@@ -292,8 +500,12 @@ pub async fn oauth_callback(
                 StatusCode::CREATED,
                 json!({
                     "ok": true,
+                    "success": true,
                     "provider": cfg.id,
                     "connection_id": connection_id,
+                    "label": label,
+                    "email": meta.email,
+                    "project_id": project_id,
                     "expires_at": expires_at,
                     "has_refresh_token": row.refresh_token.is_some(),
                     "health_status": "healthy",
@@ -309,9 +521,13 @@ pub async fn oauth_callback(
 #[derive(Debug, Deserialize)]
 pub struct PollBody {
     pub state: Option<String>,
+    #[serde(alias = "deviceCode")]
     pub device_code: Option<String>,
+    #[serde(alias = "connectionId")]
     pub connection_id: Option<String>,
+    #[serde(alias = "clientId")]
     pub client_id: Option<String>,
+    #[serde(alias = "tokenUrl")]
     pub token_url: Option<String>,
     pub copilot_token_url: Option<String>,
     pub label: Option<String>,
@@ -367,17 +583,17 @@ pub async fn oauth_device_poll(
     .await
     {
         Ok(DevicePollOutcome::Pending) => {
-            json_status(StatusCode::ACCEPTED, json!({"status": "pending"}))
+            json_status(StatusCode::ACCEPTED, json!({"status": "pending", "pending": true}))
         }
         Ok(DevicePollOutcome::SlowDown { next_interval_secs }) => json_status(
             StatusCode::ACCEPTED,
-            json!({"status": "slow_down", "interval": next_interval_secs}),
+            json!({"status": "slow_down", "pending": true, "interval": next_interval_secs}),
         ),
         Ok(DevicePollOutcome::Expired) => {
             if let Some(ref s) = body.state {
                 let _ = state.oauth_sessions.take(s, now);
             }
-            json_status(StatusCode::GONE, json!({"status": "expired"}))
+            json_status(StatusCode::GONE, json!({"status": "expired", "error": "Device code expired"}))
         }
         Ok(DevicePollOutcome::Denied(reason)) => {
             if let Some(ref s) = body.state {
@@ -408,6 +624,19 @@ pub async fn oauth_device_poll(
                     psj["copilot_token_url"] = Value::String(cu.clone());
                 }
             }
+            let meta = if token_url.is_none() {
+                run_post_exchange_discovery(&state.dispatcher.client, cfg, &tok).await
+            } else {
+                Default::default()
+            };
+            merge_json_objects(&mut psj, meta.provider_specific);
+
+            let label = body
+                .label
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| meta.display_name.clone())
+                .or_else(|| meta.email.clone())
+                .unwrap_or_else(|| cfg.display_name.to_string());
             let expires_at = tok.expires_at_ms(now);
             let row = CredentialRow {
                 provider: cfg.id.to_string(),
@@ -419,7 +648,7 @@ pub async fn oauth_device_poll(
                 enabled: true,
                 priority: 0,
                 weight: 1.0,
-                label: body.label.unwrap_or_else(|| cfg.display_name.to_string()),
+                label: label.clone(),
                 refresh_token: tok.refresh_token,
                 expires_at,
                 provider_specific_json: psj,
@@ -437,8 +666,11 @@ pub async fn oauth_device_poll(
                 StatusCode::CREATED,
                 json!({
                     "status": "authorized",
+                    "success": true,
                     "provider": cfg.id,
                     "connection_id": connection_id,
+                    "label": label,
+                    "email": meta.email,
                     "expires_at": expires_at,
                     "has_copilot_token": row.provider_specific_json.get("copilot_token").is_some(),
                 }),
@@ -448,12 +680,15 @@ pub async fn oauth_device_poll(
     }
 }
 
-// ── POST /api/oauth/{provider}/import ───────────────────────────────
+// ── POST /api/oauth/{provider}/import & /import-token ───────────────
 
 #[derive(Debug, Deserialize)]
 pub struct ImportOAuthBody {
+    #[serde(alias = "connectionId")]
     pub connection_id: Option<String>,
+    #[serde(alias = "token")]
     pub access_token: String,
+    #[serde(alias = "refreshToken")]
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
     pub expires_in: Option<i64>,

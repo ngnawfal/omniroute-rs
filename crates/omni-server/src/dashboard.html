@@ -1154,12 +1154,45 @@ details.raw-json pre {
   </div>
 </div>
 
+<!-- UPSTREAM-PARITY OAUTH LOGIN MODAL -->
+<div class="modal-backdrop" id="oauth-modal" onclick="if(event.target===this)closeOAuthModal()">
+  <div class="modal" style="max-width:540px">
+    <div class="card-head" style="margin-bottom:10px">
+      <div>
+        <h3 class="card-title" id="oam-title">Connect OAuth Provider</h3>
+        <div class="card-sub" id="oam-sub" style="margin-top:2px">Authenticating via official provider login page</div>
+      </div>
+      <button class="btn sm ghost" onclick="closeOAuthModal()">Close</button>
+    </div>
+    <div class="seg" id="oam-mode-tabs" style="margin-bottom:14px;display:none">
+      <button data-val="browser" class="active" onclick="switchOAuthModalTab('browser')">Browser Login</button>
+      <button data-val="paste" onclick="switchOAuthModalTab('paste')">Paste Token</button>
+    </div>
+    <div id="oam-body"></div>
+    <div id="oam-paste-pane" style="display:none">
+      <p class="card-sub" style="margin:0 0 10px">Import an existing OAuth access token or setup token directly without browser redirect.</p>
+      <div class="field" style="margin-bottom:10px">
+        <label>Access token / Setup token</label>
+        <input type="password" id="oam-paste-at" placeholder="Paste access token, setup token, or session token...">
+      </div>
+      <div class="field" style="margin-bottom:12px">
+        <label>Refresh token (optional)</label>
+        <input type="password" id="oam-paste-rt" placeholder="Paste refresh token (optional)">
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn ghost" onclick="closeOAuthModal()">Cancel</button>
+        <button class="btn primary" onclick="submitOAuthModalPaste()">Save Token</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toasts"></div>
 
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let stateCache = { health: null, provFilter: 'all', comp: { rtk: 'standard', cav: 'off' }, chatHistory: [] };
+let stateCache = { health: null, provFilter: 'all', comp: { rtk: 'standard', cav: 'off' }, chatHistory: [], oauthProviders: {} };
 
 function getKey() { return localStorage.getItem('omniroute_api_key') || ''; }
 function updateAuthBadge() {
@@ -1389,8 +1422,14 @@ async function loadProviders() {
   if (stateCache.provFilter === 'claude') items = items.filter(p => p.format === 'claude');
   if (stateCache.provFilter === 'gemini') items = items.filter(p => p.format === 'gemini');
   items = items.slice(0, 96);
+  const OAUTH_ALIASES = { 'claude-code': 'claude', 'anthropic': 'claude', 'openai-native': 'chatgpt', 'copilot': 'github', 'github-copilot': 'github', 'gemini': 'gemini-cli', 'clinepass': 'cline', 'amazon-q': 'kiro' };
   $('prov-grid').innerHTML = items.map(p => {
     const initials = (p.id || '??').slice(0, 2).toUpperCase();
+    const oauthTarget = stateCache.oauthProviders[p.id] ? p.id : (OAUTH_ALIASES[p.id] && stateCache.oauthProviders[OAUTH_ALIASES[p.id]] ? OAUTH_ALIASES[p.id] : null);
+    const isOAuth = !!oauthTarget;
+    const actionBtn = isOAuth
+      ? `<button class="btn sm primary" onclick="startOAuth('${esc(oauthTarget)}','${esc(p.name || p.id)}')">Login OAuth</button>`
+      : `<button class="btn sm" onclick="openCredModal('${esc(p.id)}')">Connect</button>`;
     return `<div class="prov-card">
       <div class="prov-top">
         <div class="avatar">${esc(initials)}</div>
@@ -1404,9 +1443,10 @@ async function loadProviders() {
         <div class="row" style="gap:4px">
           <span class="tag">${esc(p.format)}</span>
           <span class="tag">${p.model_count}m</span>
+          ${isOAuth ? `<span class="tag info">oauth</span>` : ''}
           ${p.is_free_tier ? `<span class="tag accent">free</span>` : ''}
         </div>
-        <button class="btn sm" onclick="openCredModal('${esc(p.id)}')">Connect</button>
+        ${actionBtn}
       </div>
     </div>`;
   }).join('') || `<div class="empty-state" style="grid-column:1/-1"><strong>No matching providers</strong>Try another search keyword or clear filters.</div>`;
@@ -1551,56 +1591,345 @@ async function simulateRoute() {
     `</tbody></table></div>`;
 }
 
-// ── OAuth 2.0 ──
+// ── OAuth 2.0 (1:1 Upstream Auto-Redirect, /callback Relay & Device Auto-Poll) ──
+let oauthState = { active: null, pollTimer: null, countdownTimer: null, popup: null, processed: false, bc: null };
+
+function isTrueLocalhostOrigin() {
+  const h = window.location.hostname;
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+function computeOAuthRedirectUri(prov) {
+  const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+  if (prov === 'claude') return 'https://platform.claude.com/oauth/code/callback';
+  if (prov === 'codex' || prov === 'chatgpt') return 'http://localhost:1455/auth/callback';
+  if (prov === 'xai-oauth') return 'http://127.0.0.1:56121/callback';
+  if (prov === 'grok-cli') return 'http://127.0.0.1:56122/callback';
+  if (prov === 'openference') return 'http://127.0.0.1:56123/callback';
+  if (prov === 'devin-desktop') return 'http://127.0.0.1:59653/callback';
+  if (prov === 'antigravity' || prov === 'agy' || prov === 'gemini-cli') {
+    return `http://127.0.0.1:${port}/callback`;
+  }
+  if (prov === 'renderhour') {
+    const host = isTrueLocalhostOrigin() ? window.location.hostname : 'localhost';
+    return `http://${host}:${port}/callback`;
+  }
+  return `${window.location.origin}/callback`;
+}
+
+function cleanupOAuthTimers() {
+  if (oauthState.pollTimer) { clearInterval(oauthState.pollTimer); oauthState.pollTimer = null; }
+  if (oauthState.countdownTimer) { clearInterval(oauthState.countdownTimer); oauthState.countdownTimer = null; }
+  if (oauthState.bc) { try { oauthState.bc.close(); } catch {} oauthState.bc = null; }
+}
+
+function closeOAuthModal() {
+  cleanupOAuthTimers();
+  oauthState.active = null;
+  oauthState.processed = false;
+  $('oauth-modal').classList.remove('open');
+}
+
+function switchOAuthModalTab(mode) {
+  syncSeg('oam-mode-tabs', mode);
+  $('oam-body').style.display = mode === 'browser' ? 'block' : 'none';
+  $('oam-paste-pane').style.display = mode === 'paste' ? 'block' : 'none';
+}
+
 function renderOAuth(data) {
   const st = data.status || {};
-  $('nb-oauth').textContent = (data.providers || []).length;
+  const list = data.providers || [];
+  stateCache.oauthProviders = {};
+  list.forEach(p => { stateCache.oauthProviders[p.id] = p; });
+  $('nb-oauth').textContent = list.length;
   $('oauth-kpis').innerHTML = `
-    <div class="kpi"><div class="kpi-top"><span>Supported OAuth providers</span></div><div class="kpi-num">${(data.providers||[]).length}</div><div class="kpi-meta"><span>PKCE S256 &amp; RFC 8628</span></div></div>
+    <div class="kpi"><div class="kpi-top"><span>Supported OAuth providers</span></div><div class="kpi-num">${list.length}</div><div class="kpi-meta"><span>PKCE S256 &amp; RFC 8628</span></div></div>
     <div class="kpi"><div class="kpi-top"><span>Connected OAuth accounts</span></div><div class="kpi-num">${st.connected_oauth_accounts ?? 0}</div><div class="kpi-meta"><span>Pending sessions: ${st.active_pending_sessions ?? 0}</span></div></div>
     <div class="kpi"><div class="kpi-top"><span>Background refresh</span></div><div class="kpi-num">${st.healthcheck_disabled ? 'OFF' : 'ACTIVE'}</div><div class="kpi-meta"><span>Google slot: ${st.google_refresh_delay_ms ?? 0}ms</span></div></div>`;
-  $('oauth-grid').innerHTML = (data.providers || []).map(p => `<div class="prov-card">
+  $('oauth-grid').innerHTML = list.map(p => `<div class="prov-card">
     <div class="prov-top">
       <div class="avatar">${esc(p.id.slice(0,2).toUpperCase())}</div>
       <div style="min-width:0;flex:1"><div class="prov-name">${esc(p.display_name)}</div><div class="prov-id">${esc(p.id)}</div></div>
+      ${p.client_id_configured ? `<span class="tag ok">ready</span>` : `<span class="tag">env/import</span>`}
     </div>
     <div class="row" style="justify-content:space-between">
       <span class="tag ${p.flow==='pkce'?'info':p.flow==='device_code'?'accent':''}">${esc(p.flow)}</span>
-      <button class="btn sm" onclick="startOAuth('${esc(p.id)}')">Authorize</button>
+      <button class="btn sm primary" onclick="startOAuth('${esc(p.id)}','${esc(p.display_name)}')">Login &amp; Authorize</button>
     </div>
   </div>`).join('');
 }
-async function startOAuth(prov) {
-  const r = await api(`/api/oauth/${encodeURIComponent(prov)}/authorize`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-  if (!r.ok) return toast('OAuth start failed: ' + (r.data?.error || r.status), true);
+
+function setupOAuthCallbackListeners() {
+  const handleRelay = async (payload) => {
+    const act = oauthState.active;
+    if (!act || oauthState.processed || !payload) return;
+    if (payload.state && act.state && payload.state !== act.state) return;
+    if (payload.error) {
+      oauthState.processed = true;
+      renderOAuthError(payload.errorDescription || payload.error);
+      return;
+    }
+    if (payload.code) {
+      oauthState.processed = true;
+      await finishOAuthCallback(act.provider, act.state, payload.fullUrl || payload.code);
+    }
+  };
+  if (!window._omniOAuthListenerBound) {
+    window._omniOAuthListenerBound = true;
+    window.addEventListener('message', (ev) => {
+      if (ev.data?.type === 'oauth_callback' && ev.data?.data) handleRelay(ev.data.data);
+    });
+    window.addEventListener('storage', (ev) => {
+      if (ev.key === 'oauth_callback' && ev.newValue) {
+        try {
+          const parsed = JSON.parse(ev.newValue);
+          localStorage.removeItem('oauth_callback');
+          handleRelay(parsed);
+        } catch {}
+      }
+    });
+  }
+  try {
+    oauthState.bc = new BroadcastChannel('oauth_callback');
+    oauthState.bc.onmessage = (ev) => handleRelay(ev.data);
+  } catch {}
+}
+
+function renderOAuthError(msg) {
+  cleanupOAuthTimers();
+  const act = oauthState.active;
+  const retry = act ? `<button class="btn sm primary" onclick="startOAuth('${esc(act.provider)}','${esc(act.displayName)}')">Try again</button>` : '';
+  $('oam-body').innerHTML = `<div class="empty-state" style="border-color:var(--danger);text-align:left">
+    <strong style="color:var(--danger)">OAuth authentication failed</strong>
+    <div style="margin:6px 0 12px;word-break:break-word">${esc(msg)}</div>
+    <div class="row">${retry}<button class="btn sm ghost" onclick="closeOAuthModal()">Close</button></div>
+  </div>`;
+  toast('OAuth failed: ' + msg, true);
+}
+
+function renderOAuthSuccess(d) {
+  cleanupOAuthTimers();
+  const who = d.email || d.label || d.connection_id || d.provider;
+  const proj = d.project_id ? `<div class="tag ok" style="margin-top:6px">Cloud Code project: ${esc(d.project_id)}</div>` : '';
+  const html = `<div class="empty-state" style="border-color:var(--ok)">
+    <strong style="color:var(--ok);font-size:16px">✓ Connected ${esc(d.provider)}</strong>
+    <div style="margin-top:6px">Account: <span class="mono">${esc(who)}</span></div>
+    ${proj}
+    <div style="margin-top:14px"><button class="btn primary" onclick="closeOAuthModal()">Done</button></div>
+  </div>`;
+  $('oam-body').innerHTML = html;
+  $('oauth-session-box').innerHTML = html;
+  toast('Connected ' + d.provider + ' (' + who + ')');
+  refreshAll();
+}
+
+async function startOAuth(prov, displayName) {
+  cleanupOAuthTimers();
+  oauthState.processed = false;
+  const provMeta = stateCache.oauthProviders[prov];
+  const label = displayName || provMeta?.display_name || prov;
+  const isImportOnly = provMeta?.flow === 'import_only';
+
+  // Open popup synchronously inside click handler so browser popup blockers never block the redirect!
+  let popup = null;
+  if (!isImportOnly) {
+    try {
+      popup = window.open('about:blank', 'omniroute_oauth_login', 'width=620,height=740,scrollbars=yes,resizable=yes');
+      if (popup && popup.document) {
+        popup.document.title = 'Redirecting to ' + label + '...';
+        popup.document.body.innerHTML = '<div style="font-family:system-ui,sans-serif;background:#071013;color:#eef3f4;min-height:100vh;margin:0;display:flex;align-items:center;justify-content:center;font-size:15px">Redirecting to ' + esc(label) + ' login page...</div>';
+      }
+    } catch {}
+  }
+  oauthState.popup = popup;
+
+  $('oam-title').textContent = 'Connect ' + label;
+  $('oam-sub').textContent = 'Starting OAuth flow...';
+  $('oam-mode-tabs').style.display = 'inline-flex';
+  switchOAuthModalTab('browser');
+  $('oam-body').innerHTML = `<div class="empty-state"><strong>Preparing ${esc(label)} login...</strong>Requesting authorization URL from OmniRoute gateway.</div>`;
+  $('oauth-modal').classList.add('open');
+
+  const redirectUri = computeOAuthRedirectUri(prov);
+  const r = await api(`/api/oauth/${encodeURIComponent(prov)}/authorize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uri: redirectUri })
+  });
+  if (!r.ok) {
+    if (popup && !popup.closed) { try { popup.close(); } catch {} }
+    oauthState.active = { provider: prov, displayName: label };
+    renderOAuthError(r.data?.error || ('HTTP ' + r.status));
+    return;
+  }
+
   const d = r.data;
+  oauthState.active = { ...d, displayName: label };
+
   if (d.flow === 'pkce') {
-    $('oauth-session-box').innerHTML = `<div class="field" style="gap:10px">
-      <div class="row"><span class="tag info">PKCE S256</span><span class="mono">${esc(d.provider)} · ${esc(d.connection_id)}</span></div>
-      <div class="row"><a class="btn sm primary" href="${esc(d.authorize_url)}" target="_blank">Open login page</a><button class="btn sm" onclick="copyText('${esc(d.authorize_url)}')">Copy URL</button></div>
-      <input type="text" id="oa-cb-code" placeholder="Paste authorization code from callback URL">
-      <button class="btn sm primary" onclick="finishOAuthCallback('${esc(d.provider)}','${esc(d.state)}')">Complete token exchange</button>
+    const authUrl = d.authorize_url || d.authUrl;
+    let opened = false;
+    if (popup && !popup.closed) {
+      try { popup.location.href = authUrl; popup.focus(); opened = true; } catch {}
+    }
+    if (!opened) {
+      try {
+        const w = window.open(authUrl, 'omniroute_oauth_login');
+        if (w) { oauthState.popup = w; opened = true; }
+      } catch {}
+    }
+
+    setupOAuthCallbackListeners();
+    const isLocal = isTrueLocalhostOrigin();
+    const needsManualOnLan = !isLocal || prov === 'claude' || prov === 'codex' || prov === 'chatgpt';
+    const lanHint = !isLocal && (prov === 'antigravity' || prov === 'agy' || prov === 'gemini-cli' || prov === 'codex' || prov === 'chatgpt')
+      ? `<div style="background:rgba(216,255,0,.08);border:1px solid rgba(216,255,0,.28);border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5">
+          <strong>Remote / LAN Server Mode (${esc(window.location.hostname)}):</strong><br>
+          1. Login pada halaman <strong>${esc(label)}</strong> yang baru terbuka.<br>
+          2. Setelah klik Allow, browser akan redirect ke <code>${esc(d.redirect_uri)}?code=...</code> (wajar jika halaman lokal gagal dimuat).<br>
+          3. <strong>Copy seluruh URL</strong> dari address bar browser tersebut lalu paste di kolom bawah!
+        </div>`
+      : prov === 'claude'
+        ? `<div style="background:rgba(216,255,0,.08);border:1px solid rgba(216,255,0,.28);border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5">
+            Login pada halaman <strong>Claude</strong> yang baru terbuka, lalu copy kode otentikasi (format <code>code#state</code>) dan paste di bawah.
+          </div>`
+        : `<div style="background:rgba(52,211,153,.09);border:1px solid rgba(52,211,153,.3);border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5">
+            <strong>Waiting for browser login...</strong> Selesaikan login di popup yang baru terbuka. Jika tidak otomatis kembali, paste callback URL di bawah.
+          </div>`;
+
+    $('oam-sub').textContent = opened ? 'Provider login page opened in new window' : 'Popup blocked — click Open Login Page below';
+    const boxHtml = `<div class="field" style="gap:12px">
+      <div class="row" style="justify-content:space-between">
+        <span class="tag info">${prov === 'antigravity' || prov === 'agy' ? 'Google OAuth 2.0' : 'OAuth 2.0 PKCE'}</span>
+        <span class="mono" style="font-size:11.5px;color:var(--muted)">${esc(d.provider)} · ${esc(d.connection_id)}</span>
+      </div>
+      ${lanHint}
+      <div class="row">
+        <a class="btn sm primary" href="${esc(authUrl)}" target="_blank" rel="noopener">Open ${esc(label)} Login Page ↗</a>
+        <button class="btn sm" onclick="copyText('${esc(authUrl)}')">Copy Login URL</button>
+      </div>
+      <div class="field" style="gap:6px">
+        <label>${needsManualOnLan ? 'Paste full callback URL or auth code' : 'Manual fallback: paste callback URL or code'}</label>
+        <input type="text" id="oam-cb-input" placeholder="${esc(d.redirect_uri)}?code=...&state=..." onkeydown="if(event.key==='Enter')submitOAuthModalCallback()">
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn ghost" onclick="closeOAuthModal()">Cancel</button>
+        <button class="btn primary" id="oam-submit-btn" onclick="submitOAuthModalCallback()">Complete Connection</button>
+      </div>
     </div>`;
+    $('oam-body').innerHTML = boxHtml;
+    $('oauth-session-box').innerHTML = boxHtml;
+    setTimeout(() => { const inp = $('oam-cb-input'); if (inp && needsManualOnLan) inp.focus(); }, 100);
+
   } else if (d.flow === 'device_code') {
-    $('oauth-session-box').innerHTML = `<div class="field" style="gap:10px">
-      <div class="row"><span class="tag accent">Device Code</span><span class="mono">${esc(d.provider)}</span></div>
-      <div style="font-size:24px;font-weight:700;font-family:var(--font-mono);letter-spacing:0.08em">${esc(d.user_code)}</div>
-      <div class="row"><a class="btn sm primary" href="${esc(d.verification_uri)}" target="_blank">Open verification page</a><button class="btn sm" onclick="pollDeviceCode('${esc(d.provider)}','${esc(d.state)}')">Poll status</button></div>
+    const verifyUrl = d.verification_uri_complete || d.verification_uri;
+    if (popup && !popup.closed && verifyUrl) {
+      try { popup.location.href = verifyUrl; popup.focus(); } catch {}
+    }
+    const expiresSec = Math.max(60, Number(d.expires_in) || 900);
+    const intervalMs = Math.max(3, Number(d.interval) || 5) * 1000;
+    const deadline = Date.now() + expiresSec * 1000;
+
+    $('oam-sub').textContent = 'Device verification page opened — polling automatically';
+    const dcHtml = `<div class="field" style="gap:12px">
+      <div class="row" style="justify-content:space-between">
+        <span class="tag accent">RFC 8628 Device Code</span>
+        <span class="tag" id="oam-dc-timer">Expires in ${expiresSec}s</span>
+      </div>
+      <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:12px;padding:16px;text-align:center">
+        <div style="font-size:11.5px;color:var(--muted);margin-bottom:6px">Enter this code on the verification page</div>
+        <div style="font-size:28px;font-weight:750;font-family:var(--font-mono);letter-spacing:0.12em;color:var(--accent)">${esc(d.user_code)}</div>
+      </div>
+      <div class="row">
+        <a class="btn sm primary" href="${esc(verifyUrl)}" target="_blank" rel="noopener">Open Verification Page ↗</a>
+        <button class="btn sm" onclick="copyText('${esc(d.user_code)}')">Copy Code</button>
+        <button class="btn sm ghost" onclick="pollDeviceCode('${esc(d.provider)}','${esc(d.state)}')">Check now</button>
+      </div>
+      <div class="card-sub" id="oam-dc-status" style="margin:0">Waiting for you to approve in browser (auto-checking every ${Math.round(intervalMs/1000)}s)...</div>
     </div>`;
+    $('oam-body').innerHTML = dcHtml;
+    $('oauth-session-box').innerHTML = dcHtml;
+
+    oauthState.countdownTimer = setInterval(() => {
+      const rem = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      const el = $('oam-dc-timer');
+      if (el) el.textContent = rem > 0 ? `Expires in ${Math.floor(rem/60)}m ${rem%60}s` : 'Expired';
+      if (rem <= 0) renderOAuthError('Device authorization timed out. Please try again.');
+    }, 1000);
+
+    oauthState.pollTimer = setInterval(async () => {
+      if (!oauthState.active || oauthState.processed) return;
+      const pr = await api(`/api/oauth/${encodeURIComponent(d.provider)}/poll`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state: d.state })
+      });
+      if (pr.status === 201 || pr.data?.status === 'authorized' || pr.data?.success) {
+        oauthState.processed = true;
+        renderOAuthSuccess(pr.data);
+      } else if (pr.status === 410 || pr.status === 403) {
+        oauthState.processed = true;
+        renderOAuthError(pr.data?.error || pr.data?.status || 'Authorization denied or expired');
+      }
+    }, intervalMs);
+
   } else {
-    $('oauth-session-box').innerHTML = `<div class="empty-state"><strong>Import-only provider (${esc(d.provider)})</strong>Use the manual token import form below to save your session token.</div>`;
+    $('oam-sub').textContent = 'Import session token from ' + label;
+    $('oam-body').innerHTML = `<div class="field" style="gap:10px">
+      <div class="empty-state" style="text-align:left"><strong>${esc(label)} uses token import</strong>Sign in to <a href="${esc(d.authorize_url)}" target="_blank" style="color:var(--accent)">${esc(d.authorize_url)}</a> then switch to the <em>Paste Token</em> tab above to import your token.</div>
+      <div class="row"><a class="btn sm primary" href="${esc(d.authorize_url)}" target="_blank">Open ${esc(label)} ↗</a><button class="btn sm" onclick="switchOAuthModalTab('paste')">Paste Token</button></div>
+    </div>`;
+    $('oauth-session-box').innerHTML = $('oam-body').innerHTML;
   }
 }
-async function finishOAuthCallback(prov, state) {
-  const code = $('oa-cb-code').value.trim();
-  if (!code) return toast('Paste the callback code first', true);
-  const r = await api(`/api/oauth/${encodeURIComponent(prov)}/callback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, state }) });
-  if (r.ok) { toast('OAuth connected for ' + prov); refreshAll(); }
-  else toast('Exchange failed: ' + (r.data?.error || r.status), true);
+
+async function submitOAuthModalCallback() {
+  const act = oauthState.active;
+  if (!act) return;
+  const raw = ($('oam-cb-input')?.value || '').trim();
+  if (!raw) return toast('Paste the full callback URL or authorization code first', true);
+  await finishOAuthCallback(act.provider, act.state, raw);
 }
+
+async function finishOAuthCallback(prov, state, rawInput) {
+  const code = (rawInput || $('oam-cb-input')?.value || '').trim();
+  if (!code) return toast('Paste the callback URL or code first', true);
+  const btn = $('oam-submit-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Exchanging token...'; }
+  const r = await api(`/api/oauth/${encodeURIComponent(prov)}/callback`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, state })
+  });
+  if (btn) { btn.disabled = false; btn.textContent = 'Complete Connection'; }
+  if (r.ok) {
+    renderOAuthSuccess(r.data);
+  } else {
+    oauthState.processed = false;
+    renderOAuthError(r.data?.error || ('HTTP ' + r.status));
+  }
+}
+
+async function submitOAuthModalPaste() {
+  const act = oauthState.active;
+  if (!act) return;
+  const at = $('oam-paste-at').value.trim();
+  const rt = $('oam-paste-rt').value.trim();
+  if (!at) return toast('Paste an access token first', true);
+  const r = await api(`/api/oauth/${encodeURIComponent(act.provider)}/import`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ access_token: at, refresh_token: rt || undefined })
+  });
+  if (r.ok) {
+    $('oam-paste-at').value = ''; $('oam-paste-rt').value = '';
+    renderOAuthSuccess({ provider: act.provider, connection_id: r.data?.connection_id || 'imported' });
+  } else {
+    toast('Import failed: ' + (r.data?.error || r.status), true);
+  }
+}
+
 async function pollDeviceCode(prov, state) {
   const r = await api(`/api/oauth/${encodeURIComponent(prov)}/poll`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state }) });
-  if (r.status === 201) { toast('Device authorized & token saved'); refreshAll(); }
+  if (r.status === 201 || r.data?.success) { oauthState.processed = true; renderOAuthSuccess(r.data); }
   else toast('Poll status: ' + (r.data?.status || r.data?.error || r.status));
 }
 async function importOAuthToken() {

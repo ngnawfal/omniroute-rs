@@ -133,17 +133,28 @@ pub fn build_router(app_state: SharedState) -> Router {
             get(memory_skills::get_skill).delete(memory_skills::delete_skill),
         )
         .route("/api/skills/{id}/execute", post(memory_skills::execute_skill))
-        // OAuth 2.0 PKCE / Device-Code / Refresh / Background Sweep
+        // OAuth 2.0 PKCE / Device-Code / Refresh / Background Sweep (both upstream & native paths)
         .route("/api/oauth/providers", get(oauth_api::list_oauth_providers))
         .route("/api/oauth/sweep", post(oauth_api::trigger_oauth_sweep))
-        .route("/api/oauth/{provider}/authorize", post(oauth_api::start_oauth_authorize))
+        .route(
+            "/api/oauth/{provider}/authorize",
+            get(oauth_api::start_oauth_authorize_get).post(oauth_api::start_oauth_authorize),
+        )
+        .route("/api/oauth/{provider}/device-code", get(oauth_api::start_oauth_authorize_get))
         .route("/api/oauth/{provider}/callback", post(oauth_api::oauth_callback))
+        .route("/api/oauth/{provider}/exchange", post(oauth_api::oauth_callback))
         .route("/api/oauth/{provider}/poll", post(oauth_api::oauth_device_poll))
         .route("/api/oauth/{provider}/import", post(oauth_api::import_oauth_credential))
+        .route("/api/oauth/{provider}/import-token", post(oauth_api::import_oauth_credential))
         .route(
             "/api/oauth/{provider}/{connection_id}/refresh",
             post(oauth_api::manual_refresh_oauth),
         )
+        // OAuth Browser Callback Relay Pages (aligned with upstream src/app/callback/page.tsx)
+        .route("/callback", get(oauth_api::oauth_callback_relay_page))
+        .route("/auth/callback", get(oauth_api::oauth_callback_relay_page))
+        .route("/oauth-callback", get(oauth_api::oauth_callback_relay_page))
+        .route("/oauth2callback", get(oauth_api::oauth_callback_relay_page))
         .route("/api/mcp", post(api::mcp_http))
         // Database Diagnostics, Upstream Import/Export & Hot Backup
         .route("/api/db/status", get(api::db_status))
