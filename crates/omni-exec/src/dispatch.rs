@@ -588,29 +588,49 @@ pub async fn dispatch_once_detailed(
             (a, b) => a.or(b),
         };
 
-        let (base_cd, use_backoff) = classify_cooldown(status, &payload);
+        let verification_required = is_account_verification_required(status, &payload);
+        let (base_cd, use_backoff) = if verification_required {
+            (TRANSIENT_INITIAL_MS, false)
+        } else {
+            classify_cooldown(status, &payload)
+        };
         let mut cooldown_ms =
             bounded_cooldown(base_cd, use_backoff, profile.max_backoff_level, attempt_level);
         if let Some(ra) = retry_after_ms {
             cooldown_ms = cooldown_ms.max(ra);
         }
 
-        let is_terminal = resilience::is_terminal_status(status);
+        // Upstream #14848: Google Cloud Code / Antigravity `403 VALIDATION_REQUIRED`
+        // ("Verify your account to continue") is transient & operator-actionable, NOT a ban.
+        let is_terminal = !verification_required && resilience::is_terminal_status(status);
         let is_rate_limit = status == 429 || payload.to_ascii_lowercase().contains("rate limit");
 
-        resilience::record_connection_failure(&conn.provider, &conn.connection_id);
-        if status == 429 || status >= 500 || is_terminal {
-            resilience::record_provider_failure(&conn.provider);
-        }
-        if status != 400 {
+        if verification_required {
+            // Brief model-scope cooldown (5s) without tripping the provider breaker so the user
+            // can retry immediately after completing browser verification.
             resilience::lock_model(
                 &conn.provider,
                 &conn.connection_id,
                 &conn.model,
-                resilience::classify_lockout_reason(status),
-                cooldown_ms,
-                attempt_level + 1,
+                "verification_required",
+                TRANSIENT_INITIAL_MS,
+                1,
             );
+        } else {
+            resilience::record_connection_failure(&conn.provider, &conn.connection_id);
+            if status == 429 || status >= 500 || is_terminal {
+                resilience::record_provider_failure(&conn.provider);
+            }
+            if status != 400 {
+                resilience::lock_model(
+                    &conn.provider,
+                    &conn.connection_id,
+                    &conn.model,
+                    resilience::classify_lockout_reason(status),
+                    cooldown_ms,
+                    attempt_level + 1,
+                );
+            }
         }
 
         last = Some(DispatchFailure {
@@ -660,6 +680,20 @@ pub async fn dispatch_once(
     dispatch_once_detailed(dispatcher, conn, body, stream, 0)
         .await
         .map_err(|f| f.error)
+}
+
+/// Upstream #14848: Google Cloud Code / Antigravity `403 VALIDATION_REQUIRED`
+/// ("Verify your account to continue") is operator-actionable and non-terminal,
+/// unless the body also carries a genuine ban phrase.
+pub fn is_account_verification_required(status: u16, body: &str) -> bool {
+    if status != 403 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("this service has been disabled in this account for violation") {
+        return false;
+    }
+    lower.contains("verify your account to continue") || lower.contains("validation_required")
 }
 
 pub fn classify_cooldown(status: u16, error_text: &str) -> (u64, bool) {
@@ -757,6 +791,14 @@ mod tests {
         assert_eq!(ms, COOLDOWN_MS.unauthorized);
         let (ms2, _) = classify_cooldown(402, "");
         assert_eq!(ms2, COOLDOWN_MS.payment_required);
+        assert!(is_account_verification_required(
+            403,
+            r#"{"error":{"code":403,"message":"Verify your account to continue.","details":[{"reason":"VALIDATION_REQUIRED"}]}}"#
+        ));
+        assert!(!is_account_verification_required(
+            403,
+            "Verify your account to continue. This service has been disabled in this account for violation."
+        ));
     }
 
     #[test]

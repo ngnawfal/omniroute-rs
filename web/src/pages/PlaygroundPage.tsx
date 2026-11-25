@@ -15,6 +15,7 @@ import {
   Brain,
   Eye,
   RefreshCw,
+  ExternalLink,
 } from "lucide-react";
 import {
   Card,
@@ -59,6 +60,14 @@ function fmtCtx(n?: number | null): string | null {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
   return String(n);
+}
+
+function extractVerifyUrl(text: string): string | null {
+  const m = text.match(/https:\/\/accounts\.google\.com\/[^\s"'<>)]+/i);
+  if (m) return m[0];
+  const m2 = text.match(/"validation_url"\s*:\s*"(https:\/\/[^"]+)"/i);
+  if (m2) return m2[1];
+  return null;
 }
 
 export function PlaygroundPage({
@@ -939,6 +948,37 @@ export function PlaygroundPage({
                     )}
                   >
                     {m.content}
+                    {m.isError && (() => {
+                      const verifyUrl = extractVerifyUrl(m.content);
+                      if (!verifyUrl) return null;
+                      return (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-danger/25 pt-2.5">
+                          <a
+                            href={verifyUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-accent-fg hover:bg-accent-hover transition-colors"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                            Verify Google Account in Browser
+                          </a>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const ok = await copyToClipboard(verifyUrl);
+                              onToast(
+                                ok ? "Verification URL copied" : "Copy failed",
+                                ok ? "info" : "error"
+                              );
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-border-strong bg-surface px-2.5 py-1.5 text-xs font-medium text-fg hover:bg-surface-subtle cursor-pointer"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                            Copy Verify URL
+                          </button>
+                        </div>
+                      );
+                    })()}
                   </div>
                   {m.meta && m.meta.length > 0 && (
                     <div

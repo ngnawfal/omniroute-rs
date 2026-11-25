@@ -394,7 +394,50 @@ fn strip_stack_tail(v: &str) -> String {
     out
 }
 
+/// Extracts a clean, un-truncated account verification message + full `validation_url`
+/// from Google Cloud Code / Antigravity `403 VALIDATION_REQUIRED` JSON error bodies
+/// so the operator can click the verification URL in their browser without truncation.
+pub fn extract_validation_error_summary(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    if !lower.contains("validation_url")
+        && !lower.contains("validation_required")
+        && !lower.contains("verify your account to continue")
+    {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let err_obj = v.get("error").unwrap_or(&v);
+    let details = err_obj.get("details").and_then(serde_json::Value::as_array)?;
+    for item in details {
+        let meta = item.get("metadata");
+        let url = meta
+            .and_then(|m| m.get("validation_url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.starts_with("https://") || s.starts_with("http://"));
+        if let Some(val_url) = url {
+            let msg = meta
+                .and_then(|m| m.get("validation_error_message"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| err_obj.get("message").and_then(serde_json::Value::as_str))
+                .unwrap_or("Verify your account to continue.");
+            let reason = item
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("VALIDATION_REQUIRED");
+            return Some(format!(
+                "{msg} ({reason}) — Open this URL in your browser to verify your Google account, then retry: {val_url}"
+            ));
+        }
+    }
+    None
+}
+
 pub fn sanitize_error_message(message: &str) -> String {
+    if let Some(val_summary) = extract_validation_error_summary(message) {
+        let safe = redact_url_credentials(&val_summary);
+        return safe.chars().take(2048).collect();
+    }
     let mut s: String = message.chars().take(MAX_ERROR_LEN * 2).collect();
     s = strip_stack_tail(&s);
     s = redact_url_credentials(&s);
@@ -534,5 +577,34 @@ mod tests {
     fn rule_match_text_wins() {
         assert_eq!(find_matching_rule(500, "quota exhausted").unwrap().id, "quota_exhausted");
         assert_eq!(match_by_status(429).unwrap().id, "status_429");
+    }
+
+    #[test]
+    fn validation_required_preserves_full_google_verify_url() {
+        let long_url = format!(
+            "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fcloudcode.google.com%2Fverify&token_part={}",
+            "abc123XYZ".repeat(40)
+        );
+        let raw = serde_json::json!({
+            "error": {
+                "code": 403,
+                "message": "Verify your account to continue.",
+                "status": "PERMISSION_DENIED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "VALIDATION_REQUIRED",
+                    "domain": "cloudcode-pa.googleapis.com",
+                    "metadata": {
+                        "validation_error_message": "Verify your account to continue.",
+                        "validation_url_link_text": "Verify your account",
+                        "validation_url": long_url,
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let out = sanitize_error_message(&raw);
+        assert!(out.contains("Verify your account to continue."), "{out}");
+        assert!(out.contains(&long_url), "full validation_url must NOT be truncated: {out}");
     }
 }
