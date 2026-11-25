@@ -113,6 +113,10 @@ static LOCKOUTS: LazyLock<Mutex<HashMap<String, ModelLockout>>> =
 static PROVIDER_FAILURE_STREAK: LazyLock<Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn exact_lockout_key(provider: &str, conn: &str, model: &str) -> String {
+    format!("{provider}::{conn}::{model}")
+}
+
 fn lockout_key(provider: &str, conn: &str, model: &str) -> String {
     let scoped_model = crate::antigravity::quota_scoped_model(provider, model);
     format!("{provider}::{conn}::{scoped_model}")
@@ -149,8 +153,10 @@ fn lock_single(
 }
 
 /// Lock provider+connection+model for cooldownMs. Longest-of wins.
-/// For Antigravity/`agy`, locks are scoped by quota family (`family:gemini`, `family:claude`,
-/// `family:argon`) and mirrored across both `antigravity` and `agy` for the same connection.
+/// For Antigravity/`agy`, **rate-limit** locks are scoped by quota family (`family:gemini`,
+/// `family:claude`, `family:argon`) and mirrored across both `antigravity` and `agy` for the
+/// same connection. Non-quota failures (e.g. `404 model_unavailable`, `5xx server`) lock ONLY
+/// the exact model so one missing model (e.g. `gemini-2.5-pro`) never blocks sibling Gemini models.
 pub fn lock_model(
     provider: &str,
     connection_id: &str,
@@ -162,50 +168,52 @@ pub fn lock_model(
     if model.is_empty() || cooldown_ms == 0 {
         return;
     }
-    let scoped = crate::antigravity::quota_scoped_model(provider, model);
     let mut map = LOCKOUTS.lock().unwrap();
     if crate::antigravity::is_antigravity_provider(provider) {
-        lock_single(&mut map, "antigravity", connection_id, &scoped, reason, cooldown_ms, failure_count);
-        lock_single(&mut map, "agy", connection_id, &scoped, reason, cooldown_ms, failure_count);
+        let target = if reason == "rate_limit" {
+            crate::antigravity::quota_scoped_model(provider, model)
+        } else {
+            model.to_string()
+        };
+        lock_single(&mut map, "antigravity", connection_id, &target, reason, cooldown_ms, failure_count);
+        lock_single(&mut map, "agy", connection_id, &target, reason, cooldown_ms, failure_count);
     } else {
-        lock_single(&mut map, provider, connection_id, &scoped, reason, cooldown_ms, failure_count);
+        lock_single(&mut map, provider, connection_id, model, reason, cooldown_ms, failure_count);
     }
 }
 
 pub fn is_model_locked(provider: &str, connection_id: &str, model: &str) -> bool {
-    let key = lockout_key(provider, connection_id, model);
-    let mut map = LOCKOUTS.lock().unwrap();
-    match map.get(&key) {
-        Some(l) if l.until > Instant::now() => true,
-        Some(_) => {
-            map.remove(&key);
-            false
-        }
-        None => false,
-    }
+    model_lockout_remaining_ms(provider, connection_id, model).is_some()
 }
 
 pub fn model_lockout_remaining_ms(provider: &str, connection_id: &str, model: &str) -> Option<u64> {
-    let key = lockout_key(provider, connection_id, model);
+    let exact_key = exact_lockout_key(provider, connection_id, model);
+    let family_key = lockout_key(provider, connection_id, model);
     let mut map = LOCKOUTS.lock().unwrap();
-    match map.get(&key) {
-        Some(l) => {
-            let now = Instant::now();
-            if l.until > now {
-                Some((l.until - now).as_millis() as u64)
-            } else {
-                map.remove(&key);
-                None
+    let now = Instant::now();
+    let mut best: Option<u64> = None;
+    for key in [exact_key, family_key] {
+        match map.get(&key) {
+            Some(l) if l.until > now => {
+                let rem = (l.until - now).as_millis() as u64;
+                best = Some(best.map(|b| b.max(rem)).unwrap_or(rem));
             }
+            Some(_) => {
+                map.remove(&key);
+            }
+            None => {}
         }
-        None => None,
     }
+    best
 }
 
 pub fn get_lockout(provider: &str, connection_id: &str, model: &str) -> Option<ModelLockout> {
-    let key = lockout_key(provider, connection_id, model);
+    let exact_key = exact_lockout_key(provider, connection_id, model);
+    let family_key = lockout_key(provider, connection_id, model);
     let map = LOCKOUTS.lock().unwrap();
-    map.get(&key).cloned()
+    map.get(&exact_key)
+        .or_else(|| map.get(&family_key))
+        .cloned()
 }
 
 pub fn clear_model_lock(provider: &str, connection_id: &str, model: &str) {
@@ -214,7 +222,10 @@ pub fn clear_model_lock(provider: &str, connection_id: &str, model: &str) {
         let scoped = crate::antigravity::quota_scoped_model(provider, model);
         map.remove(&format!("antigravity::{connection_id}::{scoped}"));
         map.remove(&format!("agy::{connection_id}::{scoped}"));
+        map.remove(&format!("antigravity::{connection_id}::{model}"));
+        map.remove(&format!("agy::{connection_id}::{model}"));
     } else {
+        map.remove(&exact_lockout_key(provider, connection_id, model));
         map.remove(&lockout_key(provider, connection_id, model));
     }
 }

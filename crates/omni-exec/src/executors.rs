@@ -99,6 +99,27 @@ fn upsert_header(headers: &mut Vec<(String, String)>, key: &str, value: impl Int
     }
 }
 
+/// Strip non-standard reasoning/thinking fields (`reasoning_content`, `reasoning`, `thinking`,
+/// `thinking_blocks`) from historical `messages[]` when forwarding to strict OpenAI-compatible
+/// upstreams that reject unknown message properties (`extra_forbidden`).
+fn sanitize_openai_request_messages(body: &mut Value, upstream_model: &str) {
+    let lower = upstream_model.to_ascii_lowercase();
+    let keep_reasoning = lower.contains("deepseek-reasoner") || lower.contains("deepseek-r1");
+    if keep_reasoning {
+        return;
+    }
+    if let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for m in msgs {
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove("reasoning_content");
+                obj.remove("reasoning");
+                obj.remove("thinking");
+                obj.remove("thinking_blocks");
+            }
+        }
+    }
+}
+
 fn has_code_execution_tool(req: &ChatRequest) -> bool {
     let Some(tools) = &req.tools else {
         return false;
@@ -1198,6 +1219,7 @@ pub fn prepare_provider_request(
                         obj.remove(u);
                     }
                 }
+                sanitize_openai_request_messages(&mut v, upstream_model);
                 PreparedExecution {
                     endpoint,
                     body: v,
@@ -1565,5 +1587,29 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
         );
+    }
+
+    #[test]
+    fn openai_request_strips_reasoning_content_from_history_for_strict_models() {
+        let mut body = json!({
+            "model": "kimi-k2.7-code_Server_Regular",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok", "reasoning_content": "internal thought", "thinking": "abc"}
+            ]
+        });
+        sanitize_openai_request_messages(&mut body, "kimi-k2.7-code_Server_Regular");
+        let assistant = &body["messages"][1];
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("thinking").is_none());
+        assert_eq!(assistant["content"], "ok");
+
+        // DeepSeek reasoner retains reasoning_content
+        let mut ds = json!({
+            "model": "deepseek-reasoner",
+            "messages": [{"role": "assistant", "content": "ok", "reasoning_content": "step 1"}]
+        });
+        sanitize_openai_request_messages(&mut ds, "deepseek-reasoner");
+        assert_eq!(ds["messages"][0]["reasoning_content"], "step 1");
     }
 }

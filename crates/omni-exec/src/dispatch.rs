@@ -636,7 +636,24 @@ pub async fn dispatch_once_detailed(
         // ("Verify your account to continue") and `403 SUBSCRIPTION_REQUIRED` are
         // operator-actionable and should not lock out the entire provider breaker.
         let is_terminal = !non_terminal_403 && resilience::is_terminal_status(status);
-        let is_rate_limit = status == 429 || payload.to_ascii_lowercase().contains("rate limit");
+        let lower_payload = payload.to_ascii_lowercase();
+        let is_rate_limit = status == 429
+            || lower_payload.contains("rate limit")
+            || lower_payload.contains("rate_limited")
+            || lower_payload.contains("resource_exhausted");
+        let is_payload_validation = status == 400
+            || status == 422
+            || lower_payload.contains("extra_forbidden")
+            || lower_payload.contains("extra inputs are not permitted");
+        // Single-model quota/rate-limit, 404 model-not-found, or payload schema errors
+        // must ONLY lock the failing model (or Antigravity quota family for 429) — NEVER
+        // trip the provider-wide or connection-wide circuit breaker, otherwise sibling
+        // healthy models on the same provider (e.g. `agy/gemini-3-flash` when Claude 429s,
+        // or `nocta-digital/DeepSeek` when Kimi 503s) get falsely skipped!
+        let is_model_scoped_only = is_rate_limit
+            || is_payload_validation
+            || status == 404
+            || status == 410;
 
         if non_terminal_403 {
             // Brief model-scope cooldown (5s) without tripping the provider breaker so the user
@@ -653,21 +670,42 @@ pub async fn dispatch_once_detailed(
                 TRANSIENT_INITIAL_MS,
                 1,
             );
-        } else {
-            resilience::record_connection_failure(&conn.provider, &conn.connection_id);
-            if status == 429 || status >= 500 || is_terminal {
-                resilience::record_provider_failure(&conn.provider);
-            }
+        } else if is_model_scoped_only {
             if status != 400 {
+                let lock_reason = if is_rate_limit {
+                    "rate_limit"
+                } else if is_payload_validation {
+                    "payload_validation"
+                } else {
+                    resilience::classify_lockout_reason(status)
+                };
+                let lock_cd = if is_payload_validation {
+                    TRANSIENT_INITIAL_MS
+                } else {
+                    cooldown_ms
+                };
                 resilience::lock_model(
                     &conn.provider,
                     &conn.connection_id,
                     &conn.model,
-                    resilience::classify_lockout_reason(status),
-                    cooldown_ms,
+                    lock_reason,
+                    lock_cd,
                     attempt_level + 1,
                 );
             }
+        } else {
+            resilience::record_connection_failure(&conn.provider, &conn.connection_id);
+            if status >= 500 || is_terminal {
+                resilience::record_provider_failure(&conn.provider);
+            }
+            resilience::lock_model(
+                &conn.provider,
+                &conn.connection_id,
+                &conn.model,
+                resilience::classify_lockout_reason(status),
+                cooldown_ms,
+                attempt_level + 1,
+            );
         }
 
         last = Some(DispatchFailure {
@@ -913,6 +951,13 @@ mod tests {
 
         resilience::clear_model_lock("antigravity", "acct-1", "claude-sonnet-4-6");
         assert!(!resilience::is_model_locked("agy", "acct-1", "claude-opus-4-6"));
+
+        // Non-quota 404 model_unavailable on one Gemini model must NOT lock sibling Gemini models!
+        resilience::lock_model("agy", "acct-1", "gemini-2.5-pro", "model_unavailable", 120_000, 1);
+        assert!(resilience::is_model_locked("agy", "acct-1", "gemini-2.5-pro"));
+        assert!(!resilience::is_model_locked("agy", "acct-1", "gemini-2.5-flash"));
+        assert!(!resilience::is_model_locked("agy", "acct-1", "gemini-3-flash"));
+        resilience::clear_all_lockouts();
     }
 
     #[tokio::test]
