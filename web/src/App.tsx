@@ -36,9 +36,50 @@ import {
   type OAuthProviderMeta,
 } from "./lib/api";
 
+const VALID_TABS: readonly NavTab[] = [
+  "overview",
+  "providers",
+  "playground",
+  "combos",
+  "oauth",
+  "quota",
+  "analytics",
+  "cli",
+  "security",
+  "optimization",
+  "mitm",
+  "a2a",
+  "memory",
+  "database",
+];
+
+function parseNavTab(raw: string | null | undefined): NavTab | null {
+  if (!raw) return null;
+  const clean = raw.replace(/^#\/?/, "").trim().toLowerCase();
+  return (VALID_TABS as readonly string[]).includes(clean) ? (clean as NavTab) : null;
+}
+
+function getInitialTab(): NavTab {
+  try {
+    const fromHash = parseNavTab(window.location.hash);
+    if (fromHash) return fromHash;
+    const fromStorage = parseNavTab(localStorage.getItem("omniroute_active_tab"));
+    if (fromStorage) return fromStorage;
+  } catch {
+    // ignore storage/window errors
+  }
+  return "overview";
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<NavTab>("overview");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [activeTab, setActiveTab] = useState<NavTab>(getInitialTab);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("omniroute_sidebar_collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [mobileOpen, setMobileOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [apiKeyOpen, setApiKeyOpen] = useState(false);
@@ -121,6 +162,32 @@ export default function App() {
       localStorage.setItem("omniroute_appearance", appearance);
     } catch {}
   }, [theme, appearance]);
+
+  // Persist active tab to URL hash + localStorage so refresh & Back/Forward preserve current page
+  useEffect(() => {
+    try {
+      localStorage.setItem("omniroute_active_tab", activeTab);
+      const targetHash = `#${activeTab}`;
+      if (window.location.hash !== targetHash) {
+        window.history.replaceState(null, "", targetHash);
+      }
+    } catch {}
+  }, [activeTab]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const next = parseNavTab(window.location.hash);
+      if (next) setActiveTab(next);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("omniroute_sidebar_collapsed", sidebarCollapsed ? "1" : "0");
+    } catch {}
+  }, [sidebarCollapsed]);
 
   // Global Ctrl+K shortcut for Command Palette
   useEffect(() => {

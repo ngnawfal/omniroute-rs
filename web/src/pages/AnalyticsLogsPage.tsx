@@ -209,7 +209,19 @@ export function AnalyticsLogsPage({
   isDark: boolean;
   onToast: (msg: string, tone?: "success" | "error" | "info") => void;
 }) {
-  const [activeTab, setActiveTab] = useState<ActiveTab>("logs");
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
+    try {
+      const saved = localStorage.getItem("omniroute_logs_subtab");
+      if (saved === "logs" || saved === "analytics" || saved === "budgets") return saved;
+    } catch {}
+    return "logs";
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("omniroute_logs_subtab", activeTab);
+    } catch {}
+  }, [activeTab]);
   const [days, setDays] = useState(14);
   const [analytics, setAnalytics] = useState<any>(null);
   const [logs, setLogs] = useState<CallLogItem[]>([]);
