@@ -1,0 +1,108 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: omniroute-rs-linux-x86_64.tar.gz
+            bin: omniroute-rs
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            asset: omniroute-rs-linux-aarch64.tar.gz
+            bin: omniroute-rs
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: omniroute-rs-macos-aarch64.tar.gz
+            bin: omniroute-rs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: omniroute-rs-windows-x86_64.zip
+            bin: omniroute-rs.exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js & build embedded React UI
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build web/dist
+        working-directory: web
+        run: |
+          npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+          npm run build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install ARM64 cross-compiler (Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }} --bin omniroute-rs
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} .
+          tar -czf ${{ matrix.asset }} ${{ matrix.bin }} README.md README.en.md
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.bin }} .
+          Compress-Archive -Path ${{ matrix.bin }}, README.md, README.en.md -DestinationPath ${{ matrix.asset }} -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
