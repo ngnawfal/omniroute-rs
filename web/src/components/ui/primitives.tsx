@@ -90,6 +90,45 @@ export function CardTitle({
   );
 }
 
+export function CardDescription({
+  className,
+  children,
+}: {
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <p className={cn("mt-0.5 text-xs text-fg-muted", className)}>{children}</p>
+  );
+}
+
+export function StatCard({
+  label,
+  value,
+  sub,
+  icon,
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+  icon?: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-surface p-4">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium uppercase tracking-wider text-fg-muted">
+          {label}
+        </span>
+        {icon}
+      </div>
+      <div className="mt-1.5 font-mono text-xl font-semibold tracking-tight text-fg">
+        {value}
+      </div>
+      {sub && <div className="mt-1 text-[11px] text-fg-muted">{sub}</div>}
+    </div>
+  );
+}
+
 export function CardContent({
   className,
   children,

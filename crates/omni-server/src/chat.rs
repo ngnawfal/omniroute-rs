@@ -135,6 +135,10 @@ pub fn authorize_request(
     headers: &HeaderMap,
     is_anthropic: bool,
 ) -> Result<Option<String>, Response> {
+    // Allow authenticated dashboard sessions (signed HttpOnly cookie) when password lock is active
+    if state.is_dashboard_locked() && crate::part_a::has_valid_dashboard_session(state, headers) {
+        return Ok(extract_api_key(headers));
+    }
     let key = extract_api_key(headers);
     let valid = state
         .store
@@ -182,6 +186,7 @@ fn no_cache_requested(headers: &HeaderMap) -> bool {
 }
 
 fn build_connection(
+    state: &SharedState,
     provider: &ProviderDescriptor,
     model: &str,
     stream: bool,
@@ -263,6 +268,7 @@ fn build_connection(
         timeout_ms: provider.timeout_ms,
         raw_body_override: None,
         force_gzip: false,
+        proxy_url: state.resolve_proxy_for(&provider.id, cred),
     })
 }
 
@@ -558,6 +564,32 @@ pub(crate) async fn execute_chat_pipeline(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let surface_path = match surface {
+        ResponseSurface::OpenAiChat => "/v1/chat/completions",
+        ResponseSurface::AnthropicMessages => "/v1/messages",
+        ResponseSurface::OpenAiResponses => "/v1/responses",
+        ResponseSurface::GeminiNative => "/v1beta/models",
+        ResponseSurface::LegacyCompletion => "/v1/completions",
+    };
+
+    // 0. Hard Budget Cap Enforcement (daily/weekly/monthly per-key & global caps)
+    if let Err((status, msg)) = crate::part_a::check_budget_enforcement(&state, &key_hash) {
+        if !no_log {
+            crate::part_a::write_call_log(
+                &state,
+                surface_path,
+                status.as_u16(),
+                "gateway",
+                "",
+                &requested_model,
+                0,
+                0,
+                0,
+                Some(msg.clone()),
+            );
+        }
+        return format_error_response(status, &msg, is_anthropic, None);
+    }
 
     // 1. Guardrails: Prompt Injection + PII Masking / Reversible PII Vault
     let mut pii_vault = PiiVault::default();
@@ -770,7 +802,7 @@ pub(crate) async fn execute_chat_pipeline(
                 None => None,
             };
             let Some(base_conn) =
-                build_connection(&provider_desc, &candidate.model, stream, active_cred.as_ref())
+                build_connection(&state, &provider_desc, &candidate.model, stream, active_cred.as_ref())
             else {
                 continue;
             };
@@ -812,6 +844,7 @@ pub(crate) async fn execute_chat_pipeline(
                         {
                             if let Ok(fresh) = refresh_credential_now(&state, c, None, None).await {
                                 if let Some(retry_conn) = build_connection(
+                                    &state,
                                     &provider_desc,
                                     &candidate.model,
                                     stream,
@@ -856,6 +889,13 @@ pub(crate) async fn execute_chat_pipeline(
 
                     if stream {
                         if !no_log {
+                            let est_cost = crate::part_a::estimate_cost_usd(
+                                &conn.provider,
+                                &candidate.model,
+                                prompt_tokens_est,
+                                0,
+                                provider_desc.is_free_tier,
+                            );
                             let _ = state.store.record_usage_full(&UsageEntry {
                                 ts_ms: now_ms(),
                                 provider: conn.provider.clone(),
@@ -868,10 +908,22 @@ pub(crate) async fn execute_chat_pipeline(
                                 cache_read_tokens: 0,
                                 cache_write_tokens: 0,
                                 latency_ms,
-                                cost_usd: 0.0,
+                                cost_usd: est_cost,
                                 api_key_hash: key_hash.clone(),
                                 session_id: String::new(),
                             });
+                            crate::part_a::write_call_log(
+                                &state,
+                                surface_path,
+                                status.as_u16(),
+                                &conn.provider,
+                                &conn.connection_id,
+                                &candidate.model,
+                                latency_ms,
+                                prompt_tokens_est,
+                                0,
+                                None,
+                            );
                         }
                         state.record_gamification_action(
                             if is_combo { XpAction::ComboUse } else { XpAction::Request },
@@ -908,6 +960,13 @@ pub(crate) async fn execute_chat_pipeline(
                                 extract_usage_tokens(&v)
                             };
                             if !no_log {
+                                let est_cost = crate::part_a::estimate_cost_usd(
+                                    &conn.provider,
+                                    &candidate.model,
+                                    pt,
+                                    ct,
+                                    provider_desc.is_free_tier,
+                                );
                                 let _ = state.store.record_usage_full(&UsageEntry {
                                     ts_ms: now_ms(),
                                     provider: conn.provider.clone(),
@@ -920,10 +979,22 @@ pub(crate) async fn execute_chat_pipeline(
                                     cache_read_tokens: cr,
                                     cache_write_tokens: cw,
                                     latency_ms,
-                                    cost_usd: 0.0,
+                                    cost_usd: est_cost,
                                     api_key_hash: key_hash.clone(),
                                     session_id: String::new(),
                                 });
+                                crate::part_a::write_call_log(
+                                    &state,
+                                    surface_path,
+                                    status.as_u16(),
+                                    &conn.provider,
+                                    &conn.connection_id,
+                                    &candidate.model,
+                                    latency_ms,
+                                    pt,
+                                    ct,
+                                    None,
+                                );
                             }
                             state.record_gamification_action(
                                 if is_combo { XpAction::ComboUse } else { XpAction::Request },
@@ -996,6 +1067,25 @@ pub(crate) async fn execute_chat_pipeline(
                 }
                 Err(fail) => {
                     state.bump_metric(&exec_key, false, latency_ms as f64);
+                    if omni_exec::resilience::is_provider_in_cooldown(&conn.provider) {
+                        crate::part_a::dispatch_alert_async(
+                            state.clone(),
+                            "breaker_open",
+                            format!("Circuit breaker OPEN: {}", conn.provider),
+                            format!(
+                                "Provider '{}' entered cooldown after HTTP {} on model '{}'",
+                                conn.provider,
+                                fail.error.status(),
+                                candidate.model
+                            ),
+                            json!({
+                                "provider": conn.provider,
+                                "connection_id": conn.connection_id,
+                                "model": candidate.model,
+                                "status": fail.error.status()
+                            }),
+                        );
+                    }
                     if !no_log {
                         let _ = state.store.record_usage_full(&UsageEntry {
                             ts_ms: now_ms(),
@@ -1013,6 +1103,22 @@ pub(crate) async fn execute_chat_pipeline(
                             api_key_hash: key_hash.clone(),
                             session_id: String::new(),
                         });
+                        let err_msg = match &fail.error {
+                            OmniError::Upstream { body, .. } => body.clone().unwrap_or_else(|| format!("HTTP {}", fail.error.status())),
+                            OmniError::Network(m) | OmniError::BadRequest(m) | OmniError::Translate(m) => m.clone(),
+                        };
+                        crate::part_a::write_call_log(
+                            &state,
+                            surface_path,
+                            fail.error.status(),
+                            &conn.provider,
+                            &conn.connection_id,
+                            &candidate.model,
+                            latency_ms,
+                            0,
+                            0,
+                            Some(err_msg),
+                        );
                     }
                     // Skip outer cooldown-aware retry loop for Antigravity/agy 429s & local
                     // refusal replays so we never multiply upstream 429 attempts (antigravity429Guard.ts).

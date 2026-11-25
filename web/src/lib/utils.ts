@@ -20,6 +20,8 @@ export function fmtNumber(n: number | undefined | null): string {
   return Number(n ?? 0).toLocaleString();
 }
 
+export const fmtNum = fmtNumber;
+
 export function fmtCost(usd: number | undefined | null): string {
   return `$${Number(usd ?? 0).toFixed(4)}`;
 }

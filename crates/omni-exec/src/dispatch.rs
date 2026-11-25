@@ -40,6 +40,8 @@ pub struct ConnectionEndpoint {
     /// Allow gzipping large bodies (>= 4096 bytes) even when host != `api.anthropic.com`
     /// (useful for explicit endpoints and automated tests).
     pub force_gzip: bool,
+    /// Optional per-request upstream proxy (`http://`, `https://`, `socks5://`, `socks5h://`).
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,14 +118,38 @@ pub struct DispatchFailure {
     pub is_local_refusal_replay: bool,
 }
 
+const MAX_CACHED_PROXY_CLIENTS: usize = 64;
+
 pub struct Dispatcher {
     pub client: reqwest::Client,
+    proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
 }
 
 impl Default for Dispatcher {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validates and normalizes an upstream proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`).
+pub fn validate_proxy_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("proxy URL is empty".into());
+    }
+    let parsed = reqwest::Url::parse(trimmed).map_err(|e| format!("invalid proxy URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        other => {
+            return Err(format!(
+                "unsupported proxy scheme '{other}' (expected http, https, socks5, or socks5h)"
+            ));
+        }
+    }
+    if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+        return Err("proxy URL is missing host".into());
+    }
+    Ok(trimmed.to_string())
 }
 
 impl Dispatcher {
@@ -135,7 +161,45 @@ impl Dispatcher {
                 .user_agent("omniroute-rs/0.2")
                 .build()
                 .expect("static reqwest config"),
+            proxy_clients: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns a pooled `reqwest::Client` configured for `proxy_url` (or the default direct client).
+    /// Clients are cached by proxy URL (capped at 64 entries) to keep memory footprint minimal.
+    pub fn client_for_proxy(&self, proxy_url: Option<&str>) -> Result<reqwest::Client, OmniError> {
+        let Some(raw) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(self.client.clone());
+        };
+        if raw.eq_ignore_ascii_case("direct") || raw.eq_ignore_ascii_case("none") {
+            return Ok(self.client.clone());
+        }
+        let normalized = validate_proxy_url(raw).map_err(OmniError::BadRequest)?;
+        {
+            let cache = self.proxy_clients.lock().unwrap();
+            if let Some(c) = cache.get(&normalized) {
+                return Ok(c.clone());
+            }
+        }
+        let proxy = reqwest::Proxy::all(&normalized)
+            .map_err(|e| OmniError::BadRequest(format!("proxy setup failed: {e}")))?;
+        let built = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(600))
+            .pool_idle_timeout(Duration::from_secs(60))
+            .user_agent("omniroute-rs/0.2")
+            .build()
+            .map_err(|e| OmniError::Network(format!("proxy client build failed: {e}")))?;
+        let mut cache = self.proxy_clients.lock().unwrap();
+        if cache.len() >= MAX_CACHED_PROXY_CLIENTS {
+            cache.clear();
+        }
+        cache.insert(normalized, built.clone());
+        Ok(built)
+    }
+
+    pub fn cached_proxy_count(&self) -> usize {
+        self.proxy_clients.lock().unwrap().len()
     }
 }
 
@@ -246,12 +310,12 @@ fn build_post_request(
     url: &str,
     conn: &ConnectionEndpoint,
     stream: bool,
-) -> reqwest::RequestBuilder {
+) -> Result<reqwest::RequestBuilder, OmniError> {
     let is_ag = crate::antigravity::is_antigravity_provider(&conn.provider);
     let is_agy_cli = conn.provider.eq_ignore_ascii_case("agy");
 
-    let mut req = dispatcher
-        .client
+    let client = dispatcher.client_for_proxy(conn.proxy_url.as_deref())?;
+    let mut req = client
         .post(url)
         .header("Content-Type", "application/json");
     if let Some(ms) = conn.timeout_ms {
@@ -300,7 +364,7 @@ fn build_post_request(
             req = req.header(k.as_str(), v.as_str());
         }
     }
-    req
+    Ok(req)
 }
 
 async fn attempt(
@@ -317,7 +381,7 @@ async fn attempt(
 
     if let Some(origin) = should_gzip_request(url, conn, serialized.len()) {
         if let Ok(compressed) = gzip_encode_json_body(&serialized) {
-            let resp = build_post_request(dispatcher, url, conn, stream)
+            let resp = build_post_request(dispatcher, url, conn, stream)?
                 .header("Content-Encoding", "gzip")
                 .body(compressed)
                 .send()
@@ -338,16 +402,13 @@ async fn attempt(
             } else if (status == 400 || status == 403) && !from_anthropic {
                 true
             } else if status == 400 {
-                // Peek body to detect gzip JSON parse refusal; if not a refusal, reconstruct response?
-                // Since reqwest::Response is consumed on `.text()`, only consume when status == 400
-                // and resend uncompressed if refusal detected; otherwise return Upstream error directly.
                 let text = resp.text().await.unwrap_or_default();
                 let not_json = text.contains("The request body is not valid JSON")
                     || text.contains("Failed to parse request: could not parse request body as JSON");
                 if not_json {
                     latch_origin_gzip(&origin);
                     tracing::warn!(origin = %origin, status, "origin refused gzip body; resending uncompressed");
-                    return build_post_request(dispatcher, url, conn, stream)
+                    return build_post_request(dispatcher, url, conn, stream)?
                         .body(serialized)
                         .send()
                         .await
@@ -364,7 +425,7 @@ async fn attempt(
             if is_rejection {
                 latch_origin_gzip(&origin);
                 tracing::warn!(origin = %origin, status, "origin refused gzip body; resending uncompressed");
-                return build_post_request(dispatcher, url, conn, stream)
+                return build_post_request(dispatcher, url, conn, stream)?
                     .body(serialized)
                     .send()
                     .await
@@ -374,7 +435,7 @@ async fn attempt(
         }
     }
 
-    build_post_request(dispatcher, url, conn, stream)
+    build_post_request(dispatcher, url, conn, stream)?
         .body(serialized)
         .send()
         .await
@@ -807,6 +868,7 @@ mod tests {
             timeout_ms: Some(5_000),
             raw_body_override: None,
             force_gzip: false,
+            proxy_url: None,
         };
         let env_body = serde_json::json!({
             "project": "proj-1",

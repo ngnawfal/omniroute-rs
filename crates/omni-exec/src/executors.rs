@@ -1086,6 +1086,87 @@ pub fn prepare_provider_request(
             }
         }
 
+        // 8. Trae SOLO (`trae`) — Cloud-IDE-JWT auth + Trae endpoint
+        "trae" => {
+            endpoint.auth_header = AuthHeader::Bearer;
+            endpoint.auth_prefix = Some("Cloud-IDE-JWT ".into());
+            upsert_header(&mut endpoint.extra_headers, "User-Agent", "Trae/1.0");
+            if endpoint.base_urls.is_empty()
+                || endpoint.base_urls.iter().all(|u| u.is_empty())
+            {
+                endpoint.base_urls = vec![
+                    "https://core-normal.trae.ai/api/remote/v1/chat/completions".into(),
+                ];
+            }
+            let mut v = serde_json::to_value(&target_req).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("_strategy");
+                obj.remove("_disableToolPrefix");
+                for u in unsupported_params {
+                    obj.remove(u);
+                }
+            }
+            PreparedExecution {
+                endpoint,
+                body: v,
+                tool_name_map: vec![],
+                response_format: UpstreamResponseFormat::OpenAI,
+                extra_response_headers,
+            }
+        }
+
+        // 9. Kiro / AWS Q Developer (`kiro`) — Bearer + CodeWhisperer identity headers
+        "kiro" => {
+            endpoint.auth_header = AuthHeader::Bearer;
+            upsert_header(
+                &mut endpoint.extra_headers,
+                "User-Agent",
+                "aws-sdk-js/3.0 KiroIDE/1.0",
+            );
+            upsert_header(
+                &mut endpoint.extra_headers,
+                "x-amzn-codewhisperer-optout",
+                "true",
+            );
+            let mut v = serde_json::to_value(&target_req).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("_strategy");
+                obj.remove("_disableToolPrefix");
+                for u in unsupported_params {
+                    obj.remove(u);
+                }
+            }
+            PreparedExecution {
+                endpoint,
+                body: v,
+                tool_name_map: vec![],
+                response_format: UpstreamResponseFormat::OpenAI,
+                extra_response_headers,
+            }
+        }
+
+        // 10. Cursor (`cursor`) — Ghost-mode client headers
+        "cursor" => {
+            endpoint.auth_header = AuthHeader::Bearer;
+            upsert_header(&mut endpoint.extra_headers, "x-ghost-mode", "true");
+            upsert_header(&mut endpoint.extra_headers, "x-cursor-client-version", "0.48.6");
+            let mut v = serde_json::to_value(&target_req).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("_strategy");
+                obj.remove("_disableToolPrefix");
+                for u in unsupported_params {
+                    obj.remove(u);
+                }
+            }
+            PreparedExecution {
+                endpoint,
+                body: v,
+                tool_name_map: vec![],
+                response_format: UpstreamResponseFormat::OpenAI,
+                extra_response_headers,
+            }
+        }
+
         // Default generic catalog executor
         _ => match provider.effective_wire_format(&endpoint.model) {
             WireFormat::OpenAI => {
@@ -1193,6 +1274,7 @@ mod tests {
             timeout_ms: None,
             raw_body_override: None,
             force_gzip: false,
+            proxy_url: None,
         }
     }
 

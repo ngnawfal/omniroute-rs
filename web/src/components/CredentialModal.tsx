@@ -25,6 +25,7 @@ export function CredentialModal({
   const [authType, setAuthType] = useState("bearer");
   const [label, setLabel] = useState("");
   const [customUrl, setCustomUrl] = useState("");
+  const [proxyUrl, setProxyUrl] = useState("");
   const [psjText, setPsjText] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -36,6 +37,7 @@ export function CredentialModal({
       setAuthType(initialProvider === "anthropic" ? "x-api-key" : initialProvider === "azure" ? "api-key" : "bearer");
       setLabel("");
       setCustomUrl("");
+      setProxyUrl("");
       setPsjText("");
     }
   }, [open, initialProvider]);
@@ -53,6 +55,9 @@ export function CredentialModal({
         onToast("Invalid provider-specific JSON", "error");
         return;
       }
+    }
+    if (proxyUrl.trim()) {
+      psj.proxy_url = proxyUrl.trim();
     }
     setSaving(true);
     const res = await apiPost("/api/providers/credentials", {
@@ -136,6 +141,18 @@ export function CredentialModal({
             <label className="text-xs font-medium text-fg">Custom Base URL (optional)</label>
             <Input value={customUrl} onChange={(e) => setCustomUrl(e.target.value)} placeholder="https://..." />
           </div>
+        </div>
+
+        <div className="space-y-1">
+          <label className="text-xs font-medium text-fg">
+            Per-Account Upstream Proxy URL (optional — <code className="font-mono">http://</code>, <code className="font-mono">socks5h://</code>, or <code className="font-mono">direct</code>)
+          </label>
+          <Input
+            value={proxyUrl}
+            onChange={(e) => setProxyUrl(e.target.value)}
+            placeholder="socks5h://user:pass@127.0.0.1:1080"
+            className="font-mono text-xs"
+          />
         </div>
 
         <div className="space-y-1">

@@ -182,6 +182,30 @@ const BASE_MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );",
+    // 16 — OpenAI /v1/files storage (bounded lightweight blobs)
+    "CREATE TABLE IF NOT EXISTS openai_files (
+        id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        purpose TEXT NOT NULL DEFAULT 'batch',
+        bytes INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        content BLOB NOT NULL
+    );",
+    // 17 — OpenAI /v1/batches jobs
+    "CREATE TABLE IF NOT EXISTS openai_batches (
+        id TEXT PRIMARY KEY,
+        input_file_id TEXT NOT NULL,
+        output_file_id TEXT,
+        error_file_id TEXT,
+        endpoint TEXT NOT NULL DEFAULT '/v1/chat/completions',
+        status TEXT NOT NULL DEFAULT 'validating',
+        total_requests INTEGER NOT NULL DEFAULT 0,
+        completed_requests INTEGER NOT NULL DEFAULT 0,
+        failed_requests INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +415,67 @@ pub struct A2ATaskRow {
     pub updated_at: i64,
     #[serde(default)]
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallLogRow {
+    pub id: String,
+    pub timestamp: String,
+    pub method: String,
+    pub path: String,
+    pub status: i64,
+    pub model: String,
+    pub provider: String,
+    pub connection_id: String,
+    pub duration: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainBudgetRow {
+    pub api_key_id: String,
+    #[serde(default)]
+    pub daily_limit_usd: f64,
+    #[serde(default)]
+    pub weekly_limit_usd: f64,
+    #[serde(default)]
+    pub monthly_limit_usd: f64,
+    #[serde(default = "default_warn_threshold")]
+    pub warning_threshold: f64,
+}
+
+fn default_warn_threshold() -> f64 {
+    0.8
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiFileRow {
+    pub id: String,
+    pub filename: String,
+    pub purpose: String,
+    pub bytes: i64,
+    pub created_at: i64,
+    #[serde(skip_serializing)]
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiBatchRow {
+    pub id: String,
+    pub input_file_id: String,
+    pub output_file_id: Option<String>,
+    pub error_file_id: Option<String>,
+    pub endpoint: String,
+    pub status: String,
+    pub total_requests: i64,
+    pub completed_requests: i64,
+    pub failed_requests: i64,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    #[serde(default = "default_empty_obj")]
+    pub metadata: serde_json::Value,
 }
 
 fn ensure_column(conn: &Connection, table: &str, col: &str, def: &str) -> anyhow::Result<()> {
@@ -982,6 +1067,12 @@ impl Store {
         Ok(res)
     }
 
+    pub fn delete_model_alias(&self, alias: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM model_aliases WHERE alias = ?1", rusqlite::params![alias])?;
+        Ok(n > 0)
+    }
+
     // ── Settings ────────────────────────────────────────────────────
 
     pub fn set_setting(&self, key: &str, value: &str, now_ms: i64) -> anyhow::Result<()> {
@@ -991,6 +1082,12 @@ impl Store {
             rusqlite::params![key, value, now_ms],
         )?;
         Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM settings WHERE key = ?1", rusqlite::params![key])?;
+        Ok(n > 0)
     }
 
     pub fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -1620,6 +1717,489 @@ impl Store {
             .skip(offset)
             .take(limit)
             .collect())
+    }
+
+    // ── Call Logs Inspector (bounded 2,000 rows for low-eMMC STB) ───
+
+    pub fn record_call_log(&self, row: &CallLogRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO call_logs(
+                id, timestamp, method, path, status, model, provider, connection_id,
+                duration, tokens_in, tokens_out, error_summary
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                row.id,
+                row.timestamp,
+                row.method,
+                row.path,
+                row.status,
+                row.model,
+                row.provider,
+                row.connection_id,
+                row.duration,
+                row.tokens_in,
+                row.tokens_out,
+                row.error_summary,
+            ],
+        )?;
+        // Keep table bounded to latest 2,000 entries to protect small eMMC devices
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_logs", [], |r| r.get(0))
+            .unwrap_or(0);
+        if count > 2_200 {
+            let _ = conn.execute(
+                "DELETE FROM call_logs WHERE id NOT IN (SELECT id FROM call_logs ORDER BY timestamp DESC LIMIT 2000)",
+                [],
+            );
+        }
+        Ok(())
+    }
+
+    pub fn list_call_logs(
+        &self,
+        limit: usize,
+        provider: Option<&str>,
+        status_class: Option<&str>,
+        q: Option<&str>,
+    ) -> anyhow::Result<Vec<CallLogRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, COALESCE(method,'POST'), COALESCE(path,''), COALESCE(status,0),
+                    COALESCE(model,''), COALESCE(provider,''), COALESCE(connection_id,''),
+                    COALESCE(duration,0), COALESCE(tokens_in,0), COALESCE(tokens_out,0), error_summary
+             FROM call_logs ORDER BY timestamp DESC LIMIT 2000",
+        )?;
+        let all: Vec<CallLogRow> = stmt
+            .query_map([], |r| {
+                Ok(CallLogRow {
+                    id: r.get(0)?,
+                    timestamp: r.get(1)?,
+                    method: r.get(2)?,
+                    path: r.get(3)?,
+                    status: r.get(4)?,
+                    model: r.get(5)?,
+                    provider: r.get(6)?,
+                    connection_id: r.get(7)?,
+                    duration: r.get(8)?,
+                    tokens_in: r.get(9)?,
+                    tokens_out: r.get(10)?,
+                    error_summary: r.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let ql = q.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+        let pf = provider.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+        let sc = status_class.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+        Ok(all
+            .into_iter()
+            .filter(|row| {
+                if let Some(ref p) = pf {
+                    if row.provider.to_ascii_lowercase() != *p {
+                        return false;
+                    }
+                }
+                if let Some(ref s) = sc {
+                    let ok = match s.as_str() {
+                        "2xx" | "ok" | "success" => (200..300).contains(&row.status),
+                        "4xx" => (400..500).contains(&row.status),
+                        "5xx" => row.status >= 500,
+                        "err" | "error" => row.status >= 400 || row.status == 0,
+                        other => other.parse::<i64>().map(|code| row.status == code).unwrap_or(true),
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                if let Some(ref needle) = ql {
+                    let hit = row.model.to_ascii_lowercase().contains(needle)
+                        || row.provider.to_ascii_lowercase().contains(needle)
+                        || row.connection_id.to_ascii_lowercase().contains(needle)
+                        || row.path.to_ascii_lowercase().contains(needle)
+                        || row
+                            .error_summary
+                            .as_deref()
+                            .map(|e| e.to_ascii_lowercase().contains(needle))
+                            .unwrap_or(false);
+                    if !hit {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(limit.min(2000))
+            .collect())
+    }
+
+    pub fn clear_call_logs(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM call_logs", [])?;
+        Ok(n)
+    }
+
+    // ── Daily Analytics & Latency Percentiles ───────────────────────
+
+    pub fn usage_analytics(&self, days: i64, now_ms: i64) -> anyhow::Result<serde_json::Value> {
+        let clamped_days = days.clamp(1, 90);
+        let since_ms = now_ms - clamped_days * 86_400_000;
+        let conn = self.conn.lock().unwrap();
+
+        let mut daily_stmt = conn.prepare(
+            "SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch') AS day,
+                    COUNT(*),
+                    COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(AVG(latency_ms), 0.0),
+                    SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END)
+             FROM usage
+             WHERE ts >= ?1
+             GROUP BY day
+             ORDER BY day ASC",
+        )?;
+        let daily: Vec<serde_json::Value> = daily_stmt
+            .query_map(rusqlite::params![since_ms], |r| {
+                Ok(serde_json::json!({
+                    "date": r.get::<_, String>(0)?,
+                    "requests": r.get::<_, i64>(1)?,
+                    "prompt_tokens": r.get::<_, i64>(2)?,
+                    "completion_tokens": r.get::<_, i64>(3)?,
+                    "total_tokens": r.get::<_, i64>(4)?,
+                    "cost_usd": r.get::<_, f64>(5)?,
+                    "avg_latency_ms": r.get::<_, f64>(6)?.round(),
+                    "errors": r.get::<_, i64>(7)?,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut top_stmt = conn.prepare(
+            "SELECT provider, model, COUNT(*), COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0), COALESCE(AVG(latency_ms), 0.0),
+                    SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END)
+             FROM usage
+             WHERE ts >= ?1
+             GROUP BY provider, model
+             ORDER BY COUNT(*) DESC
+             LIMIT 25",
+        )?;
+        let by_model: Vec<serde_json::Value> = top_stmt
+            .query_map(rusqlite::params![since_ms], |r| {
+                let reqs: i64 = r.get(2)?;
+                let errs: i64 = r.get(6)?;
+                let err_rate = if reqs > 0 { (errs as f64) / (reqs as f64) } else { 0.0 };
+                Ok(serde_json::json!({
+                    "provider": r.get::<_, String>(0)?,
+                    "model": r.get::<_, String>(1)?,
+                    "requests": reqs,
+                    "total_tokens": r.get::<_, i64>(3)?,
+                    "cost_usd": r.get::<_, f64>(4)?,
+                    "avg_latency_ms": r.get::<_, f64>(5)?.round(),
+                    "errors": errs,
+                    "error_rate": err_rate,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut lat_stmt = conn.prepare(
+            "SELECT latency_ms FROM usage WHERE ts >= ?1 AND latency_ms > 0 ORDER BY id DESC LIMIT 1000",
+        )?;
+        let mut latencies: Vec<i64> = lat_stmt
+            .query_map(rusqlite::params![since_ms], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        latencies.sort_unstable();
+        let p50 = if latencies.is_empty() {
+            0
+        } else {
+            latencies[latencies.len() / 2]
+        };
+        let p95 = if latencies.is_empty() {
+            0
+        } else {
+            let idx = ((latencies.len() as f64) * 0.95).floor() as usize;
+            latencies[idx.min(latencies.len() - 1)]
+        };
+
+        let spend_24h: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1",
+            rusqlite::params![now_ms - 86_400_000],
+            |r| r.get(0),
+        )?;
+        let spend_7d: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1",
+            rusqlite::params![now_ms - 7 * 86_400_000],
+            |r| r.get(0),
+        )?;
+        let spend_30d: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1",
+            rusqlite::params![now_ms - 30 * 86_400_000],
+            |r| r.get(0),
+        )?;
+
+        let (window_reqs, window_tokens, window_cost, window_errors): (i64, i64, f64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_usd), 0.0),
+                        SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END)
+                 FROM usage WHERE ts >= ?1",
+                rusqlite::params![since_ms],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<i64>>(3)?.unwrap_or(0))),
+            )?;
+
+        Ok(serde_json::json!({
+            "days": clamped_days,
+            "window": {
+                "requests": window_reqs,
+                "total_tokens": window_tokens,
+                "cost_usd": window_cost,
+                "errors": window_errors,
+                "p50_latency_ms": p50,
+                "p95_latency_ms": p95,
+            },
+            "spend": {
+                "daily_usd": spend_24h,
+                "weekly_usd": spend_7d,
+                "monthly_usd": spend_30d,
+            },
+            "daily": daily,
+            "by_model": by_model,
+        }))
+    }
+
+    // ── Domain Budgets (Hard Cost Caps) ─────────────────────────────
+
+    pub fn upsert_domain_budget(&self, row: &DomainBudgetRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO domain_budgets(
+                api_key_id, daily_limit_usd, weekly_limit_usd, monthly_limit_usd, warning_threshold
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                row.api_key_id,
+                row.daily_limit_usd.max(0.0),
+                row.weekly_limit_usd.max(0.0),
+                row.monthly_limit_usd.max(0.0),
+                row.warning_threshold.clamp(0.1, 1.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_domain_budgets(&self) -> anyhow::Result<Vec<DomainBudgetRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT api_key_id, COALESCE(daily_limit_usd,0), COALESCE(weekly_limit_usd,0),
+                    COALESCE(monthly_limit_usd,0), COALESCE(warning_threshold,0.8)
+             FROM domain_budgets ORDER BY api_key_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DomainBudgetRow {
+                    api_key_id: r.get(0)?,
+                    daily_limit_usd: r.get(1)?,
+                    weekly_limit_usd: r.get(2)?,
+                    monthly_limit_usd: r.get(3)?,
+                    warning_threshold: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_domain_budget(&self, api_key_id: &str) -> anyhow::Result<Option<DomainBudgetRow>> {
+        let conn = self.conn.lock().unwrap();
+        let res = conn
+            .query_row(
+                "SELECT api_key_id, COALESCE(daily_limit_usd,0), COALESCE(weekly_limit_usd,0),
+                        COALESCE(monthly_limit_usd,0), COALESCE(warning_threshold,0.8)
+                 FROM domain_budgets WHERE api_key_id = ?1",
+                rusqlite::params![api_key_id],
+                |r| {
+                    Ok(DomainBudgetRow {
+                        api_key_id: r.get(0)?,
+                        daily_limit_usd: r.get(1)?,
+                        weekly_limit_usd: r.get(2)?,
+                        monthly_limit_usd: r.get(3)?,
+                        warning_threshold: r.get(4)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(res)
+    }
+
+    pub fn delete_domain_budget(&self, api_key_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM domain_budgets WHERE api_key_id = ?1",
+            rusqlite::params![api_key_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn spend_usd_since(&self, api_key_hash: &str, since_ms: i64) -> anyhow::Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let spend: f64 = if api_key_hash.is_empty() || api_key_hash == "*" || api_key_hash == "global" {
+            conn.query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE ts >= ?1",
+                rusqlite::params![since_ms],
+                |r| r.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage WHERE api_key_hash = ?1 AND ts >= ?2",
+                rusqlite::params![api_key_hash, since_ms],
+                |r| r.get(0),
+            )?
+        };
+        Ok(spend)
+    }
+
+    // ── OpenAI /v1/files & /v1/batches persistence ──────────────────
+
+    pub fn insert_openai_file(&self, row: &OpenAiFileRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO openai_files(id, filename, purpose, bytes, created_at, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                row.id,
+                row.filename,
+                row.purpose,
+                row.bytes,
+                row.created_at,
+                row.content,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_openai_file(&self, id: &str) -> anyhow::Result<Option<OpenAiFileRow>> {
+        let conn = self.conn.lock().unwrap();
+        let res = conn
+            .query_row(
+                "SELECT id, filename, purpose, bytes, created_at, content FROM openai_files WHERE id = ?1",
+                rusqlite::params![id],
+                |r| {
+                    Ok(OpenAiFileRow {
+                        id: r.get(0)?,
+                        filename: r.get(1)?,
+                        purpose: r.get(2)?,
+                        bytes: r.get(3)?,
+                        created_at: r.get(4)?,
+                        content: r.get(5)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(res)
+    }
+
+    pub fn list_openai_files(&self) -> anyhow::Result<Vec<OpenAiFileRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, purpose, bytes, created_at FROM openai_files ORDER BY created_at DESC LIMIT 200",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(OpenAiFileRow {
+                    id: r.get(0)?,
+                    filename: r.get(1)?,
+                    purpose: r.get(2)?,
+                    bytes: r.get(3)?,
+                    created_at: r.get(4)?,
+                    content: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_openai_file(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM openai_files WHERE id = ?1", rusqlite::params![id])?;
+        Ok(n > 0)
+    }
+
+    pub fn upsert_openai_batch(&self, row: &OpenAiBatchRow) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO openai_batches(
+                id, input_file_id, output_file_id, error_file_id, endpoint, status,
+                total_requests, completed_requests, failed_requests, created_at, completed_at, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                row.id,
+                row.input_file_id,
+                row.output_file_id,
+                row.error_file_id,
+                row.endpoint,
+                row.status,
+                row.total_requests,
+                row.completed_requests,
+                row.failed_requests,
+                row.created_at,
+                row.completed_at,
+                serde_json::to_string(&row.metadata)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_openai_batch(&self, id: &str) -> anyhow::Result<Option<OpenAiBatchRow>> {
+        let conn = self.conn.lock().unwrap();
+        let res = conn
+            .query_row(
+                "SELECT id, input_file_id, output_file_id, error_file_id, endpoint, status,
+                        total_requests, completed_requests, failed_requests, created_at, completed_at, metadata_json
+                 FROM openai_batches WHERE id = ?1",
+                rusqlite::params![id],
+                |r| {
+                    Ok(OpenAiBatchRow {
+                        id: r.get(0)?,
+                        input_file_id: r.get(1)?,
+                        output_file_id: r.get(2)?,
+                        error_file_id: r.get(3)?,
+                        endpoint: r.get(4)?,
+                        status: r.get(5)?,
+                        total_requests: r.get(6)?,
+                        completed_requests: r.get(7)?,
+                        failed_requests: r.get(8)?,
+                        created_at: r.get(9)?,
+                        completed_at: r.get(10)?,
+                        metadata: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or(serde_json::json!({})),
+                    })
+                },
+            )
+            .ok();
+        Ok(res)
+    }
+
+    pub fn list_openai_batches(&self) -> anyhow::Result<Vec<OpenAiBatchRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, input_file_id, output_file_id, error_file_id, endpoint, status,
+                    total_requests, completed_requests, failed_requests, created_at, completed_at, metadata_json
+             FROM openai_batches ORDER BY created_at DESC LIMIT 100",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(OpenAiBatchRow {
+                    id: r.get(0)?,
+                    input_file_id: r.get(1)?,
+                    output_file_id: r.get(2)?,
+                    error_file_id: r.get(3)?,
+                    endpoint: r.get(4)?,
+                    status: r.get(5)?,
+                    total_requests: r.get(6)?,
+                    completed_requests: r.get(7)?,
+                    failed_requests: r.get(8)?,
+                    created_at: r.get(9)?,
+                    completed_at: r.get(10)?,
+                    metadata: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or(serde_json::json!({})),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 

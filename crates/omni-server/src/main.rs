@@ -12,6 +12,7 @@ mod cli;
 mod extended;
 mod memory_skills;
 mod oauth_api;
+mod part_a;
 mod state;
 mod status;
 
@@ -46,6 +47,19 @@ pub fn build_router(app_state: SharedState) -> Router {
             get(extended::list_search_providers).post(extended::search),
         )
         .route("/v1/web/fetch", post(extended::web_fetch))
+        // OpenAI Files & Async Batches API
+        .route("/v1/files", get(part_a::list_files).post(part_a::upload_file))
+        .route(
+            "/v1/files/{id}",
+            get(part_a::get_file).delete(part_a::delete_file),
+        )
+        .route("/v1/files/{id}/content", get(part_a::get_file_content))
+        .route(
+            "/v1/batches",
+            get(part_a::list_batches).post(part_a::create_batch),
+        )
+        .route("/v1/batches/{id}", get(part_a::get_batch))
+        .route("/v1/batches/{id}/cancel", post(part_a::cancel_batch))
         // Models & Self-Service API
         .route("/v1/models", get(chat::list_models))
         .route("/v1/models/{*model}", get(chat::get_model))
@@ -162,6 +176,42 @@ pub fn build_router(app_state: SharedState) -> Router {
         .route("/api/db/import/json", post(api::db_import_json))
         .route("/api/db/import/upstream-sqlite", post(api::db_import_upstream_sqlite))
         .route("/api/db/backup", post(api::db_backup))
+        // Part A: Proxies, Logs, Analytics, Budgets, Quota/Sync, Aliases, CLI Tools, OpenAPI, Auth, Alerts
+        .route(
+            "/api/proxies",
+            get(part_a::get_proxies).put(part_a::put_proxies),
+        )
+        .route("/api/proxies/test", post(part_a::test_proxy))
+        .route("/api/logs", get(part_a::list_logs).delete(part_a::clear_logs))
+        .route("/api/logs/export", get(part_a::export_logs))
+        .route("/api/analytics", get(part_a::get_analytics))
+        .route(
+            "/api/budgets",
+            get(part_a::list_budgets).post(part_a::upsert_budget),
+        )
+        .route("/api/budgets/{id}", delete(part_a::delete_budget))
+        .route("/api/quota", get(part_a::get_quota_monitor))
+        .route(
+            "/api/providers/{provider}/{connection_id}/sync-models",
+            post(part_a::sync_provider_models),
+        )
+        .route(
+            "/api/aliases",
+            get(part_a::list_aliases).post(part_a::upsert_alias),
+        )
+        .route("/api/aliases/{alias}", delete(part_a::delete_alias))
+        .route("/api/cli-tools", get(part_a::get_cli_tools_config))
+        .route("/api/openapi", get(part_a::get_openapi_spec))
+        .route("/api/auth/status", get(part_a::auth_status))
+        .route("/api/auth/setup", post(part_a::auth_setup))
+        .route("/api/auth/login", post(part_a::auth_login))
+        .route("/api/auth/logout", post(part_a::auth_logout))
+        .route("/api/auth/password", delete(part_a::auth_disable))
+        .route(
+            "/api/alerts/config",
+            get(part_a::get_alerts_config).put(part_a::put_alerts_config),
+        )
+        .route("/api/alerts/test", post(part_a::test_alert))
         // Liveness & Embedded Interactive React + Tailwind v4 Web Dashboard SPA
         .route("/healthz", get(|| async { "ok" }))
         .route("/", get(status::status_page))
@@ -1326,7 +1376,7 @@ mod tests {
         assert_eq!(svg_res.status(), reqwest::StatusCode::OK);
         assert!(svg_res.text().await.unwrap().contains("<svg"));
 
-        // 2. Database status & 15-table diagnostics
+        // 2. Database status & 17-table diagnostics
         let db_st: Value = client
             .get(format!("{base}/api/db/status"))
             .send()
@@ -1336,7 +1386,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db_st["ok"], true);
-        assert_eq!(db_st["applied_migrations"], 15);
+        assert_eq!(db_st["applied_migrations"], 17);
         assert!(db_st["table_counts"]["call_logs"].is_number());
         assert!(db_st["table_counts"]["domain_budgets"].is_number());
 
@@ -1400,5 +1450,388 @@ mod tests {
         let bak_json: Value = bak.json().await.unwrap();
         assert_eq!(bak_json["ok"], true);
         assert!(bak_json["size_bytes"].as_u64().unwrap() > 4096);
+    }
+
+    #[tokio::test]
+    async fn part_a_proxies_logs_analytics_budgets_aliases_auth_alerts_files_batches_e2e() {
+        let webhook_hits = Arc::new(AtomicUsize::new(0));
+        let wh_clone = webhook_hits.clone();
+
+        // Mock upstream OpenAI + Webhook receiver + /models discovery
+        let mock_app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|axum::Json(req): axum::Json<Value>| async move {
+                    let msg = req["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or("ok")
+                        .to_string();
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "id": "chatcmpl-pa",
+                                "object": "chat.completion",
+                                "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("pa:{msg}")}, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async {
+                    axum::Json(json!({
+                        "data": [
+                            {"id": "claude-sonnet-4-6"},
+                            {"id": "gpt-5.3-codex"}
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/hook",
+                post(move |_body: String| {
+                    let h = wh_clone.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_port = mock_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_app).await;
+        });
+
+        let (base, st) = spawn_test_server().await;
+        st.store
+            .upsert_custom_provider(
+                "mock-pa",
+                &[format!("http://127.0.0.1:{mock_port}/v1")],
+                "bearer",
+                "/chat/completions",
+                "openai",
+                &["claude-sonnet-4-6".into()],
+            )
+            .unwrap();
+        st.store
+            .upsert_credential(
+                "mock-pa",
+                "acct-1",
+                "bearer",
+                "sk-mock",
+                &[format!("http://127.0.0.1:{mock_port}/v1")],
+                &[],
+            )
+            .unwrap();
+        st.reload_catalog().unwrap();
+
+        let client = reqwest::Client::new();
+
+        // 1. Proxies config validation & roundtrip (rejects invalid scheme, accepts socks5/http)
+        let bad_px = client
+            .put(format!("{base}/api/proxies"))
+            .json(&json!({"global": "ftp://1.2.3.4:21"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_px.status(), 400);
+
+        let good_px = client
+            .put(format!("{base}/api/proxies"))
+            .json(&json!({
+                "global": "socks5h://127.0.0.1:1080",
+                "providers": {"mock-pa": "direct"},
+                "pool": ["http://127.0.0.1:8080"],
+                "apply_to_oauth": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(good_px.status(), 200);
+        let px_json: Value = good_px.json().await.unwrap();
+        assert_eq!(px_json["config"]["global"], "socks5h://127.0.0.1:1080");
+        assert_eq!(px_json["config"]["providers"]["mock-pa"], "direct");
+        // Verify per-provider "direct" overrides global proxy!
+        assert_eq!(st.resolve_proxy_for("mock-pa", None), None);
+        assert_eq!(
+            st.resolve_proxy_for("other-provider", None).as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+
+        // 2. Model Alias + Inference -> Call Logs + Analytics + Export
+        let al = client
+            .post(format!("{base}/api/aliases"))
+            .json(&json!({"alias": "my-fast", "target": "mock-pa/claude-sonnet-4-6"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(al.status(), 201);
+
+        let chat_r = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({
+                "model": "my-fast",
+                "messages": [{"role": "user", "content": "hello alias"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat_r.status(), 200);
+        let chat_json: Value = chat_r.json().await.unwrap();
+        assert_eq!(chat_json["choices"][0]["message"]["content"], "pa:hello alias");
+
+        let logs: Value = client
+            .get(format!("{base}/api/logs?provider=mock-pa"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(logs["count"], 1);
+        assert_eq!(logs["logs"][0]["tokens_in"], 1000);
+        assert_eq!(logs["logs"][0]["tokens_out"], 500);
+
+        let csv = client
+            .get(format!("{base}/api/logs/export?format=csv"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(csv.starts_with("id,timestamp,method,path"));
+        assert!(csv.contains("mock-pa"));
+
+        let analytics: Value = client
+            .get(format!("{base}/api/analytics?days=7"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(analytics["window"]["requests"], 1);
+        assert!(analytics["window"]["cost_usd"].as_f64().unwrap() > 0.0);
+
+        // 3. Live Model Sync + Quota Monitor
+        let sync: Value = client
+            .post(format!("{base}/api/providers/mock-pa/acct-1/sync-models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sync["ok"], true);
+        assert_eq!(sync["models_count"], 2);
+
+        let quota: Value = client
+            .get(format!("{base}/api/quota"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(quota["accounts"][0]["synced_models_count"], 2);
+
+        // 4. Hard Budget Cap Enforcement (triggers 402 + Webhook alert)
+        let al_cfg = client
+            .put(format!("{base}/api/alerts/config"))
+            .json(&json!({
+                "enabled": true,
+                "webhook_url": format!("http://127.0.0.1:{mock_port}/hook"),
+                "webhook_secret": "s3cr3t",
+                "on_budget_alert": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(al_cfg.status(), 200);
+
+        let test_al: Value = client
+            .post(format!("{base}/api/alerts/test"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(test_al["results"]["webhook"]["ok"], true);
+        assert_eq!(webhook_hits.load(Ordering::SeqCst), 1);
+
+        // Set tiny global daily budget ($0.0001) -> already exceeded by first request -> 402!
+        let bud = client
+            .post(format!("{base}/api/budgets"))
+            .json(&json!({
+                "api_key_id": "global",
+                "daily_limit_usd": 0.0001,
+                "weekly_limit_usd": 10.0,
+                "monthly_limit_usd": 50.0,
+                "warning_threshold": 0.8
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bud.status(), 201);
+
+        let blocked = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({
+                "model": "my-fast",
+                "messages": [{"role": "user", "content": "over budget"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), 402);
+
+        // Remove budget so batch test can run
+        let _ = client.delete(format!("{base}/api/budgets/global")).send().await.unwrap();
+
+        // 5. CLI Tools Auto-Configurator & OpenAPI 3.1 Spec
+        let cli_tools: Value = client
+            .get(format!("{base}/api/cli-tools"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(cli_tools["tools"].as_array().unwrap().len() >= 7);
+
+        let openapi: Value = client
+            .get(format!("{base}/api/openapi"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(openapi["openapi"], "3.1.0");
+        assert!(openapi["paths"]["/api/proxies"].is_object());
+
+        // 6. OpenAI /v1/files + /v1/batches async execution
+        let jsonl = format!(
+            "{}\n",
+            json!({
+                "custom_id": "req-1",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {"model": "my-fast", "messages": [{"role": "user", "content": "batch hi"}]}
+            })
+        );
+        let up_file: Value = client
+            .post(format!("{base}/v1/files"))
+            .json(&json!({"filename": "jobs.jsonl", "purpose": "batch", "content": jsonl}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let fid = up_file["id"].as_str().unwrap().to_string();
+
+        let batch: Value = client
+            .post(format!("{base}/v1/batches"))
+            .json(&json!({"input_file_id": fid, "endpoint": "/v1/chat/completions"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let bid = batch["id"].as_str().unwrap().to_string();
+
+        // Wait briefly for async batch worker to complete
+        let mut completed_batch = batch;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            completed_batch = client
+                .get(format!("{base}/v1/batches/{bid}"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if completed_batch["status"] == "completed" {
+                break;
+            }
+        }
+        assert_eq!(completed_batch["status"], "completed");
+        assert_eq!(completed_batch["request_counts"]["completed"], 1);
+        let out_fid = completed_batch["output_file_id"].as_str().unwrap();
+        let out_txt = client
+            .get(format!("{base}/v1/files/{out_fid}/content"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(out_txt.contains("pa:batch hi"));
+
+        // 7. Dashboard Password Auth (lock -> 401 without cookie -> login -> cookie grants access -> disable)
+        let setup_r = client
+            .post(format!("{base}/api/auth/setup"))
+            .json(&json!({"password": "super-secret-password"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(setup_r.status(), 200);
+        let cookie_hdr = setup_r
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // Unauthenticated management call must be 401
+        let unauth = client
+            .get(format!("{base}/api/proxies"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        // Authenticated with session cookie succeeds
+        let authed = client
+            .get(format!("{base}/api/proxies"))
+            .header("Cookie", &cookie_hdr)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), 200);
+
+        // Disable password lock
+        let dis = client
+            .delete(format!("{base}/api/auth/password"))
+            .header("Cookie", &cookie_hdr)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dis.status(), 200);
+        let st_after: Value = client
+            .get(format!("{base}/api/auth/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(st_after["locked"], false);
     }
 }

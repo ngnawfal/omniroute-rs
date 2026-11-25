@@ -64,6 +64,11 @@ pub fn build_health_json(state: &SharedState) -> Value {
         "default_strategy": state.default_strategy().as_str(),
         "configured_credentials": creds_count,
         "combos_count": combos_count,
+        "dashboard_locked": state.is_dashboard_locked(),
+        "alerting_enabled": state.alerting_config().enabled,
+        "upstream_proxy_configured": state.proxy_config().global.is_some()
+            || !state.proxy_config().providers.is_empty()
+            || !state.proxy_config().pool.is_empty(),
         "guardrails_enabled": state.guardrails_enabled(),
         "agent_guard_mode": state.agent_guard_mode().as_str(),
         "compression": state.compression_summary(),
@@ -246,6 +251,8 @@ pub async fn list_credentials(
                 "health_status": c.health_status,
                 "last_refreshed_at": c.last_refreshed_at,
                 "health_check_interval_min": c.health_check_interval_min,
+                "proxy_url": c.provider_specific_json.get("proxy_url").or_else(|| c.provider_specific_json.get("proxyUrl")).and_then(Value::as_str),
+                "synced_models_count": c.provider_specific_json.get("synced_models").and_then(Value::as_array).map(|a| a.len()).unwrap_or(c.models.len()),
             })
         })
         .collect();

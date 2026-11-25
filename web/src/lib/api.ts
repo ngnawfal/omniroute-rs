@@ -37,7 +37,7 @@ export async function api<T = any>(
   if (key && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${key}`);
   }
-  const res = await fetch(path, { ...opts, headers });
+  const res = await fetch(path, { credentials: "same-origin", ...opts, headers });
   const text = await res.text();
   let parsed: any = text;
   try {

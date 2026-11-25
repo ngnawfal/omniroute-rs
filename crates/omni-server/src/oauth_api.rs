@@ -430,8 +430,9 @@ pub async fn oauth_callback(
         .or_else(|| session.as_ref().map(|s| s.connection_id.clone()))
         .unwrap_or_else(|| format!("{}-default", cfg.id));
 
+    let oauth_client = state.oauth_http_client_for(cfg.id, None);
     match exchange_authorization_code_with_state(
-        &state.dispatcher.client,
+        &oauth_client,
         cfg,
         &parsed_code,
         &redirect_uri,
@@ -454,7 +455,7 @@ pub async fn oauth_callback(
             }
             // Skip external post-exchange HTTP calls when a custom mock token_url is used in tests
             let meta = if token_url.is_none() {
-                run_post_exchange_discovery(&state.dispatcher.client, cfg, &tok).await
+                run_post_exchange_discovery(&oauth_client, cfg, &tok).await
             } else {
                 Default::default()
             };
@@ -823,6 +824,7 @@ pub async fn refresh_credential_now(
     copilot_url_override: Option<&str>,
 ) -> Result<CredentialRow, (StatusCode, String)> {
     let now = now_ms();
+    let oauth_client = state.oauth_http_client_for(&cred.provider, Some(cred));
     // GitHub Copilot short-lived token refresh path
     if matches!(cred.provider.as_str(), "github" | "ghe-copilot") {
         let cu = copilot_url_override.or_else(|| {
@@ -830,7 +832,7 @@ pub async fn refresh_credential_now(
                 .get("copilot_token_url")
                 .and_then(Value::as_str)
         });
-        match exchange_copilot_token(&state.dispatcher.client, &cred.api_key, cu).await {
+        match exchange_copilot_token(&oauth_client, &cred.api_key, cu).await {
             Ok(ct) => {
                 let mut psj = cred.provider_specific_json.clone();
                 psj["copilot_token"] = Value::String(ct.token);
@@ -862,6 +864,13 @@ pub async fn refresh_credential_now(
                         "needs_reauth",
                         now,
                     );
+                    crate::part_a::dispatch_alert_async(
+                        state.clone(),
+                        "needs_reauth",
+                        format!("OAuth re-auth needed: {}/{}", cred.provider, cred.connection_id),
+                        format!("Copilot token exchange failed ({e})"),
+                        json!({"provider": cred.provider, "connection_id": cred.connection_id}),
+                    );
                 }
                 return Err((StatusCode::BAD_GATEWAY, e));
             }
@@ -889,7 +898,7 @@ pub async fn refresh_credential_now(
         .and_then(Value::as_str);
 
     match refresh_with_retry(
-        &state.dispatcher.client,
+        &oauth_client,
         &state.oauth_breaker,
         cfg,
         &cred.connection_id,
@@ -927,6 +936,13 @@ pub async fn refresh_credential_now(
                 &cred.connection_id,
                 "needs_reauth",
                 now,
+            );
+            crate::part_a::dispatch_alert_async(
+                state.clone(),
+                "needs_reauth",
+                format!("OAuth re-auth needed: {}/{}", cred.provider, cred.connection_id),
+                format!("OAuth token refresh returned unrecoverable error: {msg}"),
+                json!({"provider": cred.provider, "connection_id": cred.connection_id}),
             );
             Err((StatusCode::UNAUTHORIZED, msg))
         }

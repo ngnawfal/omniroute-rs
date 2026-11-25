@@ -11,6 +11,9 @@ import {
   Bot,
   BrainCircuit,
   Database,
+  Activity,
+  Gauge,
+  Terminal,
   Search,
   ChevronDown,
   ChevronRight,
@@ -28,6 +31,9 @@ export type NavTab =
   | "playground"
   | "combos"
   | "oauth"
+  | "quota"
+  | "analytics"
+  | "cli"
   | "security"
   | "optimization"
   | "mitm"
@@ -63,8 +69,11 @@ export const NAV_SECTIONS: Array<{
     title: "Routing & Spend",
     items: [
       { id: "combos", label: "Combos & Routing", description: "22 strategies & dry-run simulator", icon: GitBranch, badgeKey: "combos" },
+      { id: "quota", label: "Quota & Proxies", description: "Live quota bars, model sync & SOCKS5", icon: Gauge },
+      { id: "analytics", label: "Logs & Analytics", description: "Daily charts, call logs & budget caps", icon: Activity },
+      { id: "cli", label: "Aliases & CLI Tools", description: "Model aliases, IDE setup & OpenAPI", icon: Terminal },
       { id: "optimization", label: "Compression & Cache", description: "RTK, Caveman & semantic cache", icon: Sparkles },
-      { id: "security", label: "Keys & Guardrails", description: "API keys, PII vault & agent-guard", icon: ShieldCheck },
+      { id: "security", label: "Security & Alerts", description: "API keys, login lock, guardrails & alerts", icon: ShieldCheck },
     ],
   },
   {

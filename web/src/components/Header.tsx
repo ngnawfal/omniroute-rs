@@ -7,6 +7,7 @@ import {
   Palette,
   KeyRound,
   CheckCircle2,
+  LogOut,
 } from "lucide-react";
 import { Button, Badge } from "./ui/primitives";
 import { ALL_NAV_ITEMS, type NavTab } from "./Sidebar";
@@ -17,6 +18,7 @@ export function Header({
   theme,
   appearance,
   hasApiKey,
+  dashboardLocked,
   refreshing,
   onOpenMobile,
   onOpenPalette,
@@ -24,11 +26,13 @@ export function Header({
   onToggleAppearance,
   onRefresh,
   onOpenApiKey,
+  onLogout,
 }: {
   activeTab: NavTab;
   theme: "dark" | "light";
   appearance: "editions" | "classic";
   hasApiKey: boolean;
+  dashboardLocked?: boolean;
   refreshing: boolean;
   onOpenMobile: () => void;
   onOpenPalette: () => void;
@@ -36,6 +40,7 @@ export function Header({
   onToggleAppearance: () => void;
   onRefresh: () => void;
   onOpenApiKey: () => void;
+  onLogout?: () => void;
 }) {
   const current = ALL_NAV_ITEMS.find((i) => i.id === activeTab);
 
@@ -125,6 +130,12 @@ export function Header({
           )}
           <span className="hidden sm:inline">{hasApiKey ? "Key Active" : "API Key"}</span>
         </Button>
+
+        {dashboardLocked && onLogout && (
+          <Button variant="ghost" size="icon" onClick={onLogout} title="Sign out of dashboard">
+            <LogOut className="h-4 w-4 text-fg-muted" />
+          </Button>
+        )}
 
         <Badge variant="success" className="hidden xl:inline-flex font-mono">
           Rust Native

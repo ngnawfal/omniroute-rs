@@ -1,9 +1,10 @@
-import { useState } from "react";
-import { ShieldCheck, KeyRound, Copy, Plus, Lock } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { ShieldCheck, KeyRound, Copy, Plus, Lock, Bell, Send, Unlock } from "lucide-react";
 import {
   Card,
   CardHeader,
   CardTitle,
+  CardDescription,
   CardContent,
   Badge,
   Button,
@@ -13,16 +14,20 @@ import {
   PageHeader,
   EmptyState,
 } from "@/components/ui/primitives";
-import { apiPost, apiPut } from "@/lib/api";
+import { api, apiDelete, apiPost, apiPut } from "@/lib/api";
 
 export function SecurityPage({
   keys,
   guardrails,
+  dashboardLocked,
+  onAuthChanged,
   onRefresh,
   onToast,
 }: {
   keys: any[];
   guardrails: any;
+  dashboardLocked?: boolean;
+  onAuthChanged?: () => void;
   onRefresh: () => void;
   onToast: (msg: string, tone?: "success" | "error" | "info") => void;
 }) {
@@ -31,6 +36,100 @@ export function SecurityPage({
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [ruleName, setRuleName] = useState("");
   const [ruleRegex, setRuleRegex] = useState("");
+
+  // Dashboard password lock state
+  const [dashPassword, setDashPassword] = useState("");
+  const [savingAuth, setSavingAuth] = useState(false);
+
+  // Webhook & Telegram alerting state
+  const [alertEnabled, setAlertEnabled] = useState(false);
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [webhookSecret, setWebhookSecret] = useState("");
+  const [tgToken, setTgToken] = useState("");
+  const [tgChatId, setTgChatId] = useState("");
+  const [onReauth, setOnReauth] = useState(true);
+  const [onBreaker, setOnBreaker] = useState(true);
+  const [onBudget, setOnBudget] = useState(true);
+  const [testingAlert, setTestingAlert] = useState(false);
+
+  const loadAlerts = useCallback(async () => {
+    const r = await api<any>("/api/alerts/config");
+    if (r.ok && r.data?.config) {
+      const c = r.data.config;
+      setAlertEnabled(!!c.enabled);
+      setWebhookUrl(c.webhook_url || "");
+      setWebhookSecret(c.webhook_secret || "");
+      setTgToken(c.telegram_bot_token || "");
+      setTgChatId(c.telegram_chat_id || "");
+      setOnReauth(c.on_needs_reauth !== false);
+      setOnBreaker(c.on_breaker_open !== false);
+      setOnBudget(c.on_budget_alert !== false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAlerts();
+  }, [loadAlerts]);
+
+  const setDashboardPassword = async () => {
+    if (dashPassword.trim().length < 4) {
+      onToast("Password must be at least 4 characters", "error");
+      return;
+    }
+    setSavingAuth(true);
+    const r = await apiPost("/api/auth/setup", { password: dashPassword.trim() });
+    setSavingAuth(false);
+    if (r.ok) {
+      setDashPassword("");
+      onToast("Dashboard password lock enabled (session cookie active)", "success");
+      onAuthChanged?.();
+      onRefresh();
+    } else {
+      onToast(r.error || "Failed to set password", "error");
+    }
+  };
+
+  const disableDashboardPassword = async () => {
+    const r = await apiDelete("/api/auth/password");
+    if (r.ok) {
+      onToast("Dashboard password lock disabled", "info");
+      onAuthChanged?.();
+      onRefresh();
+    } else {
+      onToast(r.error || "Failed to disable password lock", "error");
+    }
+  };
+
+  const saveAlerts = async () => {
+    const r = await apiPut("/api/alerts/config", {
+      enabled: alertEnabled,
+      webhook_url: webhookUrl.trim(),
+      webhook_secret: webhookSecret.trim(),
+      telegram_bot_token: tgToken.trim(),
+      telegram_chat_id: tgChatId.trim(),
+      on_needs_reauth: onReauth,
+      on_breaker_open: onBreaker,
+      on_budget_alert: onBudget,
+    });
+    if (r.ok) {
+      onToast("Webhook & Telegram alert settings saved", "success");
+      void loadAlerts();
+      onRefresh();
+    } else {
+      onToast(r.error || "Failed to save alert settings", "error");
+    }
+  };
+
+  const sendTestAlert = async () => {
+    setTestingAlert(true);
+    const r = await apiPost("/api/alerts/test", {});
+    setTestingAlert(false);
+    if (r.ok) {
+      onToast("Test alert dispatched! Check your Webhook / Telegram.", "success");
+    } else {
+      onToast(r.error || "Test alert failed", "error");
+    }
+  };
 
   const createKey = async () => {
     const body: any = { label: label.trim() || "dashboard" };
@@ -253,6 +352,121 @@ export function SecurityPage({
               <Button variant="default" size="sm" onClick={addPattern}>
                 Add Rule
               </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Dashboard Password Auth + Webhook & Telegram Alerting */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Lock className="h-4 w-4 text-accent-ink" />
+              <div>
+                <CardTitle>Dashboard Password Lock</CardTitle>
+                <CardDescription>
+                  Protect the Web UI &amp; <code className="font-mono">/api/*</code> on LAN/public networks with signed HttpOnly session cookies
+                </CardDescription>
+              </div>
+            </div>
+            <Badge variant={dashboardLocked ? "success" : "default"}>
+              {dashboardLocked ? "Locked" : "Unlocked"}
+            </Badge>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <Input
+                type="password"
+                value={dashPassword}
+                onChange={(e) => setDashPassword(e.target.value)}
+                placeholder={dashboardLocked ? "New password (min 4 chars)..." : "Set dashboard password..."}
+                className="flex-1"
+              />
+              <Button variant="primary" size="sm" disabled={savingAuth} onClick={setDashboardPassword}>
+                <Lock className="h-3.5 w-3.5" />
+                {dashboardLocked ? "Update Password" : "Enable Lock"}
+              </Button>
+              {dashboardLocked && (
+                <Button variant="danger" size="sm" onClick={disableDashboardPassword}>
+                  <Unlock className="h-3.5 w-3.5" /> Disable
+                </Button>
+              )}
+            </div>
+            <p className="text-[11px] text-fg-muted">
+              Inference endpoints (<code className="font-mono">/v1/*</code>) remain controlled independently by your Gateway API Keys.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Bell className="h-4 w-4 text-accent-ink" />
+              <div>
+                <CardTitle>Webhook &amp; Telegram Alerting</CardTitle>
+                <CardDescription>
+                  Instant push notifications on OAuth <code className="font-mono">needs_reauth</code>, circuit breakers &amp; budget caps
+                </CardDescription>
+              </div>
+            </div>
+            <Switch checked={alertEnabled} onChange={setAlertEnabled} />
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <Input
+                value={webhookUrl}
+                onChange={(e) => setWebhookUrl(e.target.value)}
+                placeholder="Webhook URL (https://...)"
+                className="sm:col-span-2 font-mono text-xs"
+              />
+              <Input
+                type="password"
+                value={webhookSecret}
+                onChange={(e) => setWebhookSecret(e.target.value)}
+                placeholder="HMAC secret (opt)"
+                className="font-mono text-xs"
+              />
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <Input
+                type="password"
+                value={tgToken}
+                onChange={(e) => setTgToken(e.target.value)}
+                placeholder="Telegram Bot Token"
+                className="font-mono text-xs"
+              />
+              <Input
+                value={tgChatId}
+                onChange={(e) => setTgChatId(e.target.value)}
+                placeholder="Telegram Chat ID"
+                className="font-mono text-xs"
+              />
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <div className="flex flex-wrap items-center gap-3 text-xs text-fg-muted">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="checkbox" checked={onReauth} onChange={(e) => setOnReauth(e.target.checked)} />
+                  <span>OAuth re-auth</span>
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="checkbox" checked={onBreaker} onChange={(e) => setOnBreaker(e.target.checked)} />
+                  <span>Breaker open</span>
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="checkbox" checked={onBudget} onChange={(e) => setOnBudget(e.target.checked)} />
+                  <span>Budget caps</span>
+                </label>
+              </div>
+              <div className="flex gap-2">
+                <Button variant="default" size="sm" disabled={testingAlert} onClick={sendTestAlert}>
+                  <Send className="h-3.5 w-3.5" />
+                  {testingAlert ? "Sending..." : "Test"}
+                </Button>
+                <Button variant="primary" size="sm" onClick={saveAlerts}>
+                  Save Alerts
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>

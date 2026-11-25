@@ -203,9 +203,8 @@ async fn proxy_json_endpoint(
             .unwrap_or_default();
 
         let started = std::time::Instant::now();
-        let mut req = state
-            .dispatcher
-            .client
+        let http_client = state.http_client_for(&provider_desc.id, cred.as_ref());
+        let mut req = http_client
             .post(&url)
             .header("Content-Type", "application/json");
         if let Some(hname) = auth_hdr.header_name() {

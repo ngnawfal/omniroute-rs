@@ -20,8 +20,14 @@ import { MitmPage } from "./pages/MitmPage";
 import { A2APage } from "./pages/A2APage";
 import { MemorySkillsPage } from "./pages/MemorySkillsPage";
 import { DatabasePage } from "./pages/DatabasePage";
+import { AnalyticsLogsPage } from "./pages/AnalyticsLogsPage";
+import { QuotaProxyPage } from "./pages/QuotaProxyPage";
+import { AliasesCliPage } from "./pages/AliasesCliPage";
+import { OmniRouteLogo } from "./components/OmniRouteLogo";
+import { Button, Input } from "./components/ui/primitives";
 import {
   api,
+  apiPost,
   getStoredApiKey,
   type ComboItem,
   type CredentialItem,
@@ -71,6 +77,13 @@ export default function App() {
   const [memories, setMemories] = useState<any[]>([]);
   const [skills, setSkills] = useState<any[]>([]);
   const [db, setDb] = useState<any>(null);
+  const [authState, setAuthState] = useState<{ locked: boolean; authenticated: boolean }>({
+    locked: false,
+    authenticated: true,
+  });
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
 
   // Modals
   const [oauthReq, setOAuthReq] = useState<OAuthLaunchRequest | null>(null);
@@ -117,9 +130,20 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  const checkAuth = useCallback(async () => {
+    const r = await api<any>("/api/auth/status");
+    if (r.ok && r.data) {
+      setAuthState({
+        locked: !!r.data.locked,
+        authenticated: !!r.data.authenticated,
+      });
+    }
+  }, []);
+
   const refreshAll = useCallback(async () => {
     setRefreshing(true);
     setHasApiKey(!!getStoredApiKey());
+    await checkAuth();
     const [h, g, m, gr, dbRes, memRes, skRes, oaRes, keysRes, credsRes, combosRes, tasksRes] =
       await Promise.all([
         api<GatewayHealth>("/api/health"),
@@ -174,6 +198,67 @@ export default function App() {
 
   const isDark = theme === "dark";
 
+  const handleDashboardLogin = async () => {
+    setLoggingIn(true);
+    setLoginError("");
+    const r = await apiPost("/api/auth/login", { password: loginPassword });
+    setLoggingIn(false);
+    if (r.ok) {
+      setLoginPassword("");
+      setAuthState({ locked: true, authenticated: true });
+      void refreshAll();
+    } else {
+      setLoginError(r.error || "Invalid password");
+    }
+  };
+
+  const handleDashboardLogout = async () => {
+    await apiPost("/api/auth/logout", {});
+    setAuthState((prev) => ({ ...prev, authenticated: false }));
+    addToast("Signed out of dashboard", "info");
+  };
+
+  if (authState.locked && !authState.authenticated) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-bg p-4 text-fg">
+        <div className="w-full max-w-sm rounded-2xl border border-border-strong bg-surface p-6 shadow-2xl space-y-5">
+          <div className="flex flex-col items-center text-center space-y-2">
+            <OmniRouteLogo size={40} />
+            <h1 className="text-lg font-semibold text-fg">OmniRoute RS</h1>
+            <p className="text-xs text-fg-muted">
+              This gateway dashboard is password-protected. Sign in to continue.
+            </p>
+          </div>
+          <div className="space-y-3">
+            <Input
+              type="password"
+              autoFocus
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              placeholder="Dashboard password"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleDashboardLogin();
+              }}
+            />
+            {loginError && (
+              <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+                {loginError}
+              </div>
+            )}
+            <Button
+              variant="primary"
+              className="w-full"
+              disabled={loggingIn}
+              onClick={() => void handleDashboardLogin()}
+            >
+              {loggingIn ? "Signing in..." : "Unlock Dashboard"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen overflow-hidden bg-bg text-fg">
       <Sidebar
@@ -193,6 +278,7 @@ export default function App() {
           theme={theme}
           appearance={appearance}
           hasApiKey={hasApiKey}
+          dashboardLocked={authState.locked}
           refreshing={refreshing}
           onOpenMobile={() => setMobileOpen(true)}
           onOpenPalette={() => setPaletteOpen(true)}
@@ -202,6 +288,7 @@ export default function App() {
           }
           onRefresh={() => void refreshAll()}
           onOpenApiKey={() => setApiKeyOpen(true)}
+          onLogout={() => void handleDashboardLogout()}
         />
 
         <main className="flex-1 overflow-y-auto px-4 py-6 lg:px-8">
@@ -256,10 +343,21 @@ export default function App() {
                 onToast={addToast}
               />
             )}
+            {activeTab === "quota" && (
+              <QuotaProxyPage isDark={isDark} onToast={addToast} />
+            )}
+            {activeTab === "analytics" && (
+              <AnalyticsLogsPage isDark={isDark} onToast={addToast} />
+            )}
+            {activeTab === "cli" && (
+              <AliasesCliPage isDark={isDark} onToast={addToast} />
+            )}
             {activeTab === "security" && (
               <SecurityPage
                 keys={keys}
                 guardrails={guardrails}
+                dashboardLocked={authState.locked}
+                onAuthChanged={() => void checkAuth()}
                 onRefresh={() => void refreshAll()}
                 onToast={addToast}
               />

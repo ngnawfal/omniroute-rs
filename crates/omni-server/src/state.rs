@@ -15,7 +15,8 @@ use omni_mitm::cert::CertAuthority;
 use omni_mitm::proxy::MitmProxyHandle;
 use omni_oauth::{OAuthSessionStore, RefreshCircuitBreaker, OAUTH_PROVIDERS};
 use omni_router::{normalize_strategy, Strategy};
-use omni_store::Store;
+use omni_store::{CredentialRow, Store};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,12 +30,78 @@ pub struct CompressionTotals {
     pub total_compacted_turns: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpstreamProxyConfig {
+    #[serde(default)]
+    pub global: Option<String>,
+    #[serde(default)]
+    pub providers: HashMap<String, String>,
+    #[serde(default)]
+    pub pool: Vec<String>,
+    #[serde(default)]
+    pub apply_to_oauth: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub webhook_url: String,
+    #[serde(default)]
+    pub webhook_secret: String,
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    #[serde(default)]
+    pub telegram_chat_id: String,
+    #[serde(default = "default_true_bool")]
+    pub on_needs_reauth: bool,
+    #[serde(default = "default_true_bool")]
+    pub on_breaker_open: bool,
+    #[serde(default = "default_true_bool")]
+    pub on_budget_alert: bool,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+impl Default for AlertingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_url: String::new(),
+            webhook_secret: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            on_needs_reauth: true,
+            on_breaker_open: true,
+            on_budget_alert: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DashboardAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub salt: String,
+    #[serde(default)]
+    pub password_hash: String,
+    #[serde(default)]
+    pub session_secret: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
 pub struct AppState {
     pub data_dir: String,
     pub store: Store,
     pub catalog: RwLock<Catalog>,
     pub dispatcher: Dispatcher,
     pub rr_counter: AtomicU64,
+    pub proxy_rr_counter: AtomicU64,
     pub target_metrics: RwLock<HashMap<String, TargetMetric>>,
     pub last_good: RwLock<HashMap<String, String>>,
     pub started_at: Instant,
@@ -46,6 +113,7 @@ pub struct AppState {
     pub mitm_ca: RwLock<Arc<CertAuthority>>,
     pub mitm_handle: Mutex<Option<MitmProxyHandle>>,
     pub mitm_bypass: RwLock<Vec<String>>,
+    pub alert_dedup: Mutex<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +140,7 @@ impl AppState {
             catalog: RwLock::new(catalog),
             dispatcher: Dispatcher::default(),
             rr_counter: AtomicU64::new(0),
+            proxy_rr_counter: AtomicU64::new(0),
             target_metrics: RwLock::new(HashMap::new()),
             last_good: RwLock::new(HashMap::new()),
             started_at: Instant::now(),
@@ -83,6 +152,7 @@ impl AppState {
             mitm_ca: RwLock::new(Arc::new(mitm_ca)),
             mitm_handle: Mutex::new(None),
             mitm_bypass: RwLock::new(vec![]),
+            alert_dedup: Mutex::new(HashMap::new()),
         })
     }
 
@@ -281,6 +351,179 @@ impl AppState {
         true
     }
 
+    // ── Upstream Proxy Resolution (Per-Account > Per-Provider > Global/Pool > Direct) ─
+
+    pub fn proxy_config(&self) -> UpstreamProxyConfig {
+        let mut cfg = self
+            .store
+            .get_setting("upstream_proxy_config")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<UpstreamProxyConfig>(&raw).ok())
+            .unwrap_or_default();
+        if cfg.global.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            if let Ok(env_p) = std::env::var("OMNIROUTE_UPSTREAM_PROXY") {
+                let trimmed = env_p.trim().to_string();
+                if !trimmed.is_empty() {
+                    cfg.global = Some(trimmed);
+                }
+            }
+        }
+        cfg
+    }
+
+    pub fn resolve_proxy_for(&self, provider: &str, cred: Option<&CredentialRow>) -> Option<String> {
+        // 1. Per-account override in provider_specific_json["proxy_url" | "proxyUrl"]
+        if let Some(c) = cred {
+            if let Some(raw) = c
+                .provider_specific_json
+                .get("proxy_url")
+                .or_else(|| c.provider_specific_json.get("proxyUrl"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if raw.eq_ignore_ascii_case("direct") || raw.eq_ignore_ascii_case("none") {
+                    return None;
+                }
+                return Some(raw.to_string());
+            }
+        }
+        let cfg = self.proxy_config();
+        // 2. Per-provider override
+        if let Some(raw) = cfg
+            .providers
+            .get(provider)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            if raw.eq_ignore_ascii_case("direct") || raw.eq_ignore_ascii_case("none") {
+                return None;
+            }
+            return Some(raw.to_string());
+        }
+        // 3. Global proxy or round-robin pool
+        if let Some(raw) = cfg.global.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !raw.eq_ignore_ascii_case("direct") && !raw.eq_ignore_ascii_case("none") {
+                return Some(raw.to_string());
+            }
+        }
+        let active_pool: Vec<&str> = cfg
+            .pool
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !active_pool.is_empty() {
+            let idx = (self.proxy_rr_counter.fetch_add(1, Ordering::Relaxed) as usize)
+                % active_pool.len();
+            return Some(active_pool[idx].to_string());
+        }
+        None
+    }
+
+    pub fn http_client_for(&self, provider: &str, cred: Option<&CredentialRow>) -> reqwest::Client {
+        let proxy = self.resolve_proxy_for(provider, cred);
+        self.dispatcher
+            .client_for_proxy(proxy.as_deref())
+            .unwrap_or_else(|_| self.dispatcher.client.clone())
+    }
+
+    pub fn oauth_http_client_for(&self, provider: &str, cred: Option<&CredentialRow>) -> reqwest::Client {
+        // Always respect explicit per-account proxy_url; otherwise follow apply_to_oauth
+        let acct_proxy = cred.and_then(|c| {
+            c.provider_specific_json
+                .get("proxy_url")
+                .or_else(|| c.provider_specific_json.get("proxyUrl"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        });
+        if let Some(p) = acct_proxy {
+            return self
+                .dispatcher
+                .client_for_proxy(Some(&p))
+                .unwrap_or_else(|_| self.dispatcher.client.clone());
+        }
+        if self.proxy_config().apply_to_oauth {
+            return self.http_client_for(provider, cred);
+        }
+        self.dispatcher.client.clone()
+    }
+
+    // ── Alerting & Dashboard Password Auth Config ───────────────────
+
+    pub fn alerting_config(&self) -> AlertingConfig {
+        self.store
+            .get_setting("alerting_config")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<AlertingConfig>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn dashboard_auth_config(&self) -> DashboardAuthConfig {
+        self.store
+            .get_setting("dashboard_auth_config")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<DashboardAuthConfig>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn is_dashboard_locked(&self) -> bool {
+        let cfg = self.dashboard_auth_config();
+        cfg.enabled && !cfg.password_hash.is_empty()
+    }
+
+    pub fn hash_dashboard_password(salt: &str, password: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(b"omniroute-dash-v1:");
+        h.update(salt.as_bytes());
+        h.update(b":");
+        h.update(password.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    pub fn verify_dashboard_password(&self, password: &str) -> bool {
+        let cfg = self.dashboard_auth_config();
+        if !cfg.enabled || cfg.password_hash.is_empty() {
+            return true;
+        }
+        let candidate = Self::hash_dashboard_password(&cfg.salt, password);
+        constant_time_eq(candidate.as_bytes(), cfg.password_hash.as_bytes())
+    }
+
+    pub fn mint_dashboard_session_token(&self) -> Option<String> {
+        let cfg = self.dashboard_auth_config();
+        if !cfg.enabled || cfg.session_secret.is_empty() {
+            return None;
+        }
+        let exp = now_ms() + 7 * 86_400_000; // 7 days
+        let payload = format!("{exp}");
+        let sig = sign_session_payload(&cfg.session_secret, &payload);
+        Some(format!("{payload}.{sig}"))
+    }
+
+    pub fn verify_dashboard_session_token(&self, token: &str) -> bool {
+        let cfg = self.dashboard_auth_config();
+        if !cfg.enabled || cfg.session_secret.is_empty() {
+            return true;
+        }
+        let Some((payload, sig)) = token.split_once('.') else {
+            return false;
+        };
+        let Ok(exp) = payload.parse::<i64>() else {
+            return false;
+        };
+        if now_ms() > exp {
+            return false;
+        }
+        let expected = sign_session_payload(&cfg.session_secret, payload);
+        constant_time_eq(sig.as_bytes(), expected.as_bytes())
+    }
+
     pub fn mitm_status_json(&self) -> serde_json::Value {
         let ca = self.mitm_ca.read().unwrap().clone();
         let bypass = self.mitm_bypass.read().unwrap().clone();
@@ -408,6 +651,26 @@ pub fn hash_api_key(key: &str) -> String {
     hasher.update(key.as_bytes());
     let digest = hasher.finalize();
     hex::encode(&digest[..12])
+}
+
+fn sign_session_payload(secret: &str, payload: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"omni-sess:");
+    h.update(secret.as_bytes());
+    h.update(b":");
+    h.update(payload.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn now_ms() -> i64 {
