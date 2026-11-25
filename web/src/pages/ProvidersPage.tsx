@@ -56,6 +56,7 @@ export function ProvidersPage({
   isDark,
   onLaunchOAuth,
   onOpenAddCred,
+  onTryInPlayground,
   onRefresh,
   onToast,
 }: {
@@ -64,6 +65,7 @@ export function ProvidersPage({
   isDark: boolean;
   onLaunchOAuth: (providerId: string, displayName: string) => void;
   onOpenAddCred: (providerId?: string) => void;
+  onTryInPlayground?: (providerId: string, rawModelId: string) => void;
   onRefresh: () => void;
   onToast: (msg: string, tone?: "success" | "error" | "info") => void;
 }) {
@@ -483,6 +485,7 @@ export function ProvidersPage({
         credentials={credentials}
         isDark={isDark}
         onClose={() => setInspectProvider(null)}
+        onTryInPlayground={onTryInPlayground}
         onSynced={onRefresh}
         onToast={onToast}
       />
@@ -514,6 +517,7 @@ function ProviderModelsModal({
   credentials,
   isDark,
   onClose,
+  onTryInPlayground,
   onSynced,
   onToast,
 }: {
@@ -521,6 +525,7 @@ function ProviderModelsModal({
   credentials: CredentialItem[];
   isDark: boolean;
   onClose: () => void;
+  onTryInPlayground?: (providerId: string, rawModelId: string) => void;
   onSynced: () => void;
   onToast: (msg: string, tone?: "success" | "error" | "info") => void;
 }) {
@@ -751,19 +756,32 @@ function ProviderModelsModal({
                       <div className="truncate text-[11px] text-fg-muted mt-0.5">{m.name}</div>
                     )}
                   </div>
-                  <Button
-                    variant="default"
-                    size="sm"
-                    onClick={() => void handleCopy(m.id)}
-                    className="shrink-0"
-                  >
-                    {copiedId === m.id ? (
-                      <Check className="h-3.5 w-3.5 text-success" />
-                    ) : (
-                      <Copy className="h-3.5 w-3.5" />
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {onTryInPlayground && provider && (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => {
+                          onTryInPlayground(provider.id, m.rawId);
+                          onClose();
+                        }}
+                      >
+                        Try
+                      </Button>
                     )}
-                    Copy ID
-                  </Button>
+                    <Button
+                      variant="default"
+                      size="sm"
+                      onClick={() => void handleCopy(m.id)}
+                    >
+                      {copiedId === m.id ? (
+                        <Check className="h-3.5 w-3.5 text-success" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" />
+                      )}
+                      Copy ID
+                    </Button>
+                  </div>
                 </div>
               );
             })}

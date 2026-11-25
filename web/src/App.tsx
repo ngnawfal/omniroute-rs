@@ -91,6 +91,10 @@ export default function App() {
     open: false,
     provider: "",
   });
+  const [playgroundTarget, setPlaygroundTarget] = useState<{
+    provider: string;
+    model: string;
+  } | null>(null);
 
   // Toasts
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -316,6 +320,10 @@ export default function App() {
                 isDark={isDark}
                 onLaunchOAuth={launchOAuth}
                 onOpenAddCred={(p) => setCredModal({ open: true, provider: p || "" })}
+                onTryInPlayground={(provider, model) => {
+                  setPlaygroundTarget({ provider, model });
+                  setActiveTab("playground");
+                }}
                 onRefresh={() => void refreshAll()}
                 onToast={addToast}
               />
@@ -323,6 +331,10 @@ export default function App() {
             {activeTab === "playground" && (
               <PlaygroundPage
                 isDark={isDark}
+                credentials={credentials}
+                combos={combos}
+                initialSelection={playgroundTarget}
+                onClearInitialSelection={() => setPlaygroundTarget(null)}
                 onAfterChat={() => void refreshAll()}
                 onToast={addToast}
               />
