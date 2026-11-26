@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Eye, EyeOff, Lock, ShieldCheck } from "lucide-react";
 import { Sidebar, type NavTab } from "./components/Sidebar";
 import { Header } from "./components/Header";
 import { CommandPalette } from "./components/CommandPalette";
@@ -24,8 +23,8 @@ import { DatabasePage } from "./pages/DatabasePage";
 import { AnalyticsLogsPage } from "./pages/AnalyticsLogsPage";
 import { QuotaProxyPage } from "./pages/QuotaProxyPage";
 import { AliasesCliPage } from "./pages/AliasesCliPage";
+import { LoginPage } from "./pages/LoginPage";
 import { OmniRouteLogo } from "./components/OmniRouteLogo";
-import { Button, Input } from "./components/ui/primitives";
 import {
   api,
   apiPost,
@@ -125,10 +124,6 @@ export default function App() {
     locked: false,
     authenticated: false,
   });
-  const [loginPassword, setLoginPassword] = useState("");
-  const [showLoginPw, setShowLoginPw] = useState(false);
-  const [loginError, setLoginError] = useState("");
-  const [loggingIn, setLoggingIn] = useState(false);
 
   // Modals
   const [oauthReq, setOAuthReq] = useState<OAuthLaunchRequest | null>(null);
@@ -294,18 +289,22 @@ export default function App() {
 
   const isDark = theme === "dark";
 
-  const handleDashboardLogin = async () => {
-    setLoggingIn(true);
-    setLoginError("");
-    const r = await apiPost("/api/auth/login", { password: loginPassword });
-    setLoggingIn(false);
+  const handleDashboardLogin = async (password: string) => {
+    const r = await apiPost<any>("/api/auth/login", { password });
     if (r.ok) {
-      setLoginPassword("");
       setAuthState({ locked: true, authenticated: true });
       void refreshAll();
-    } else {
-      setLoginError(r.error || "Invalid password");
+      return { ok: true };
     }
+    const retryAfter =
+      typeof r.data?.retry_after_secs === "number"
+        ? r.data.retry_after_secs
+        : Number.parseInt(r.headers.get("retry-after") || "0", 10) || undefined;
+    return {
+      ok: false,
+      error: r.error || "Incorrect password.",
+      retryAfter,
+    };
   };
 
   const handleDashboardLogout = async () => {
@@ -329,11 +328,10 @@ export default function App() {
 
   if (!authChecked) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-bg p-4 text-fg">
-        <div className="flex flex-col items-center gap-3 text-center">
-          <OmniRouteLogo size={42} />
-          <div className="h-5 w-5 animate-spin rounded-full border-2 border-border-strong border-t-[var(--accent)]" />
-          <span className="text-xs text-fg-muted">Checking gateway session...</span>
+      <div className="flex min-h-[100dvh] flex-col items-center justify-center bg-bg text-fg">
+        <div className="flex items-center gap-3">
+          <OmniRouteLogo size={26} />
+          <span className="font-mono text-xs text-fg-muted">Connecting…</span>
         </div>
       </div>
     );
@@ -341,64 +339,15 @@ export default function App() {
 
   if (authState.locked && !authState.authenticated) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-bg p-4 text-fg">
-        <div className="w-full max-w-sm rounded-2xl border border-border-strong bg-surface p-6 shadow-2xl space-y-5">
-          <div className="flex flex-col items-center text-center space-y-2.5">
-            <OmniRouteLogo size={44} />
-            <div className="inline-flex items-center gap-1.5 rounded-full border border-success/35 bg-success/10 px-2.5 py-0.5 text-[11px] font-medium text-success">
-              <ShieldCheck className="h-3.5 w-3.5" />
-              Protected Gateway
-            </div>
-            <h1 className="text-lg font-semibold tracking-tight text-fg">OmniRoute RS</h1>
-            <p className="text-xs text-fg-muted leading-relaxed">
-              Dashboard ini dilindungi password. Masuk dengan password admin untuk mengelola provider, combo, dan log.
-            </p>
-          </div>
-          <div className="space-y-3">
-            <div className="relative">
-              <Input
-                type={showLoginPw ? "text" : "password"}
-                autoFocus
-                autoComplete="current-password"
-                value={loginPassword}
-                onChange={(e) => setLoginPassword(e.target.value)}
-                placeholder="Dashboard password"
-                className="pr-10"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && loginPassword.trim()) void handleDashboardLogin();
-                }}
-              />
-              <button
-                type="button"
-                tabIndex={-1}
-                onClick={() => setShowLoginPw((v) => !v)}
-                aria-label={showLoginPw ? "Hide password" : "Show password"}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-fg-muted hover:text-fg cursor-pointer"
-              >
-                {showLoginPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              </button>
-            </div>
-            {loginError && (
-              <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
-                {loginError}
-              </div>
-            )}
-            <Button
-              variant="primary"
-              className="w-full"
-              disabled={loggingIn || !loginPassword.trim()}
-              onClick={() => void handleDashboardLogin()}
-            >
-              <Lock className="h-3.5 w-3.5" />
-              {loggingIn ? "Signing in..." : "Unlock Dashboard"}
-            </Button>
-          </div>
-          <div className="flex items-center justify-between border-t border-border pt-3 text-[10px] text-fg-subtle">
-            <span>Signed HttpOnly Cookie · 7d</span>
-            <span>Brute-force protected</span>
-          </div>
-        </div>
-      </div>
+      <LoginPage
+        theme={theme}
+        appearance={appearance}
+        onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+        onToggleAppearance={() =>
+          setAppearance((a) => (a === "editions" ? "classic" : "editions"))
+        }
+        onLogin={handleDashboardLogin}
+      />
     );
   }
 
