@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Eye, EyeOff, Lock, ShieldCheck } from "lucide-react";
 import { Sidebar, type NavTab } from "./components/Sidebar";
 import { Header } from "./components/Header";
 import { CommandPalette } from "./components/CommandPalette";
@@ -119,11 +120,13 @@ export default function App() {
   const [memories, setMemories] = useState<any[]>([]);
   const [skills, setSkills] = useState<any[]>([]);
   const [db, setDb] = useState<any>(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [authState, setAuthState] = useState<{ locked: boolean; authenticated: boolean }>({
     locked: false,
-    authenticated: true,
+    authenticated: false,
   });
   const [loginPassword, setLoginPassword] = useState("");
+  const [showLoginPw, setShowLoginPw] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
 
@@ -205,17 +208,26 @@ export default function App() {
   const checkAuth = useCallback(async () => {
     const r = await api<any>("/api/auth/status");
     if (r.ok && r.data) {
-      setAuthState({
+      const next = {
         locked: !!r.data.locked,
         authenticated: !!r.data.authenticated,
-      });
+      };
+      setAuthState(next);
+      setAuthChecked(true);
+      return next;
     }
+    setAuthChecked(true);
+    return { locked: false, authenticated: true };
   }, []);
 
   const refreshAll = useCallback(async () => {
     setRefreshing(true);
     setHasApiKey(!!getStoredApiKey());
-    await checkAuth();
+    const auth = await checkAuth();
+    if (auth.locked && !auth.authenticated) {
+      setRefreshing(false);
+      return;
+    }
     const [h, g, m, gr, dbRes, memRes, skRes, oaRes, keysRes, credsRes, combosRes, tasksRes] =
       await Promise.all([
         api<GatewayHealth>("/api/health"),
@@ -263,7 +275,7 @@ export default function App() {
       setStrategies(combosRes.data?.strategies || []);
     }
     if (tasksRes.ok) setA2ATasks(tasksRes.data?.tasks || []);
-  }, []);
+  }, [checkAuth]);
 
   useEffect(() => {
     void refreshAll();
@@ -298,32 +310,74 @@ export default function App() {
 
   const handleDashboardLogout = async () => {
     await apiPost("/api/auth/logout", {});
+    // Clear browser-cached API key & sensitive in-memory telemetry on logout
+    setStoredApiKey("");
+    setHasApiKey(false);
+    setHealth(null);
+    setKeys([]);
+    setCredentials([]);
+    setCombos([]);
+    setMemories([]);
+    setSkills([]);
+    setA2ATasks([]);
+    setDb(null);
+    setGuardrails(null);
+    setMitm(null);
     setAuthState((prev) => ({ ...prev, authenticated: false }));
     addToast("Signed out of dashboard", "info");
   };
+
+  if (!authChecked) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-bg p-4 text-fg">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <OmniRouteLogo size={42} />
+          <div className="h-5 w-5 animate-spin rounded-full border-2 border-border-strong border-t-[var(--accent)]" />
+          <span className="text-xs text-fg-muted">Checking gateway session...</span>
+        </div>
+      </div>
+    );
+  }
 
   if (authState.locked && !authState.authenticated) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-bg p-4 text-fg">
         <div className="w-full max-w-sm rounded-2xl border border-border-strong bg-surface p-6 shadow-2xl space-y-5">
-          <div className="flex flex-col items-center text-center space-y-2">
-            <OmniRouteLogo size={40} />
-            <h1 className="text-lg font-semibold text-fg">OmniRoute RS</h1>
-            <p className="text-xs text-fg-muted">
-              This gateway dashboard is password-protected. Sign in to continue.
+          <div className="flex flex-col items-center text-center space-y-2.5">
+            <OmniRouteLogo size={44} />
+            <div className="inline-flex items-center gap-1.5 rounded-full border border-success/35 bg-success/10 px-2.5 py-0.5 text-[11px] font-medium text-success">
+              <ShieldCheck className="h-3.5 w-3.5" />
+              Protected Gateway
+            </div>
+            <h1 className="text-lg font-semibold tracking-tight text-fg">OmniRoute RS</h1>
+            <p className="text-xs text-fg-muted leading-relaxed">
+              Dashboard ini dilindungi password. Masuk dengan password admin untuk mengelola provider, combo, dan log.
             </p>
           </div>
           <div className="space-y-3">
-            <Input
-              type="password"
-              autoFocus
-              value={loginPassword}
-              onChange={(e) => setLoginPassword(e.target.value)}
-              placeholder="Dashboard password"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void handleDashboardLogin();
-              }}
-            />
+            <div className="relative">
+              <Input
+                type={showLoginPw ? "text" : "password"}
+                autoFocus
+                autoComplete="current-password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                placeholder="Dashboard password"
+                className="pr-10"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && loginPassword.trim()) void handleDashboardLogin();
+                }}
+              />
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={() => setShowLoginPw((v) => !v)}
+                aria-label={showLoginPw ? "Hide password" : "Show password"}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-fg-muted hover:text-fg cursor-pointer"
+              >
+                {showLoginPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
             {loginError && (
               <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
                 {loginError}
@@ -332,11 +386,16 @@ export default function App() {
             <Button
               variant="primary"
               className="w-full"
-              disabled={loggingIn}
+              disabled={loggingIn || !loginPassword.trim()}
               onClick={() => void handleDashboardLogin()}
             >
+              <Lock className="h-3.5 w-3.5" />
               {loggingIn ? "Signing in..." : "Unlock Dashboard"}
             </Button>
+          </div>
+          <div className="flex items-center justify-between border-t border-border pt-3 text-[10px] text-fg-subtle">
+            <span>Signed HttpOnly Cookie · 7d</span>
+            <span>Brute-force protected</span>
           </div>
         </div>
       </div>
@@ -373,6 +432,7 @@ export default function App() {
           }
           onRefresh={() => void refreshAll()}
           onOpenApiKey={() => setApiKeyOpen(true)}
+          onOpenSecurity={() => setActiveTab("security")}
           onLogout={() => void handleDashboardLogout()}
         />
 

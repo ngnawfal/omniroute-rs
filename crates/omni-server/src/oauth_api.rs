@@ -146,7 +146,13 @@ pub async fn oauth_callback_relay_page() -> Response {
 
 // ── GET /api/oauth/providers ────────────────────────────────────────
 
-pub async fn list_oauth_providers(State(state): State<SharedState>) -> Response {
+pub async fn list_oauth_providers(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
     let items: Vec<Value> = OAUTH_PROVIDERS
         .iter()
         .map(|p| {

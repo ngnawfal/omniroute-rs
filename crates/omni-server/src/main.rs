@@ -1909,6 +1909,97 @@ mod tests {
         let locked_unauth = client.get(format!("{base}/api/logs")).send().await.unwrap();
         assert_eq!(locked_unauth.status(), 401);
 
+        // Read-only management endpoints MUST also be locked (401) and /api/health must redact sensitive telemetry
+        for path in [
+            "/api/combos",
+            "/api/settings",
+            "/api/oauth/providers",
+            "/api/guardrails/status",
+            "/api/mitm/status",
+            "/api/cli-tools",
+            "/api/usage",
+        ] {
+            let r = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(r.status(), 401, "expected 401 on {path} when dashboard is locked");
+        }
+        let min_health: Value = client
+            .get(format!("{base}/api/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(min_health["status"], "ok");
+        assert_eq!(min_health["dashboard_locked"], true);
+        assert!(min_health.get("oauth").is_none(), "locked /api/health must not leak OAuth accounts");
+        assert!(min_health.get("usage").is_none(), "locked /api/health must not leak usage stats");
+
+        // /api/settings must never expose dashboard_auth_config or let PUT overwrite it
+        let settings_authed: Value = client
+            .get(format!("{base}/api/settings"))
+            .header("Cookie", &cookie_hdr)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(settings_authed["raw"].get("dashboard_auth_config").is_none());
+        let _ = client
+            .put(format!("{base}/api/settings"))
+            .header("Cookie", &cookie_hdr)
+            .json(&json!({"dashboard_auth_config": "tampered"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(st.is_dashboard_locked(), "PUT /api/settings must not tamper with dashboard_auth_config");
+
+        // A gateway API key alone MUST NOT be able to disable Dashboard Password Lock
+        let disable_by_key = client
+            .delete(format!("{base}/api/auth/password"))
+            .header("Authorization", "Bearer sk-omni-cli-hermes")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disable_by_key.status(), 401);
+        assert!(st.is_dashboard_locked());
+
+        // Anti-brute-force rate limiting on /api/auth/login (5 failures -> 429)
+        for attempt in 1..=5 {
+            let bad = client
+                .post(format!("{base}/api/auth/login"))
+                .header("X-Forwarded-For", "10.0.0.99")
+                .json(&json!({"password": "wrong-password"}))
+                .send()
+                .await
+                .unwrap();
+            if attempt < 5 {
+                assert_eq!(bad.status(), 401);
+            } else {
+                assert_eq!(bad.status(), 429);
+                assert!(bad.headers().contains_key("retry-after"));
+            }
+        }
+        let blocked_even_valid = client
+            .post(format!("{base}/api/auth/login"))
+            .header("X-Forwarded-For", "10.0.0.99")
+            .json(&json!({"password": "dashboard-lock-pw"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked_even_valid.status(), 429);
+
+        // Another client IP can still sign in cleanly
+        let ok_other_ip = client
+            .post(format!("{base}/api/auth/login"))
+            .header("X-Forwarded-For", "10.0.0.100")
+            .json(&json!({"password": "dashboard-lock-pw"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_other_ip.status(), 200);
+
         let locked_cookie = client
             .get(format!("{base}/api/logs"))
             .header("Cookie", &cookie_hdr)

@@ -1018,6 +1018,9 @@ pub async fn get_cli_tools_config(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -1330,19 +1333,71 @@ pub struct AuthLoginBody {
     pub password: String,
 }
 
+fn login_client_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .or_else(|| headers.get("cf-connecting-ip"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("direct")
+        .to_string()
+}
+
 pub async fn auth_login(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<AuthLoginBody>,
 ) -> Response {
     if !state.is_dashboard_locked() {
         return json_ok(json!({"ok": true, "locked": false, "authenticated": true}));
     }
+    let client_key = login_client_key(&headers);
+    if let Err(retry_secs) = state.check_login_rate_limit(&client_key) {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::RETRY_AFTER, retry_secs.to_string())
+            .body(Body::from(
+                json!({
+                    "ok": false,
+                    "error": format!("Too many failed login attempts. Try again in {retry_secs}s."),
+                    "retry_after_secs": retry_secs
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
     if !state.verify_dashboard_password(&body.password) {
+        let (attempts, lockout) = state.record_login_failure(&client_key);
+        if let Some(retry_secs) = lockout {
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, retry_secs.to_string())
+                .body(Body::from(
+                    json!({
+                        "ok": false,
+                        "error": format!("Too many failed login attempts. Locked for {retry_secs}s."),
+                        "retry_after_secs": retry_secs
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+        }
+        let remaining = 5u32.saturating_sub(attempts);
         return json_status(
             StatusCode::UNAUTHORIZED,
-            json!({"ok": false, "error": "Invalid dashboard password"}),
+            json!({
+                "ok": false,
+                "error": format!("Invalid dashboard password ({remaining} attempts left)"),
+                "attempts_remaining": remaining
+            }),
         );
     }
+    state.clear_login_failures(&client_key);
     let token = state.mint_dashboard_session_token().unwrap_or_default();
     Response::builder()
         .status(StatusCode::OK)
@@ -1364,8 +1419,13 @@ pub async fn auth_logout() -> Response {
 }
 
 pub async fn auth_disable(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize_management(&state, &headers) {
-        return resp;
+    // Disabling the dashboard password lock strictly requires an active logged-in session cookie,
+    // never just a leaked /v1/* gateway API key.
+    if state.is_dashboard_locked() && !has_valid_dashboard_session(&state, &headers) {
+        return json_status(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "Active dashboard login session required to disable password lock"}),
+        );
     }
     let _ = state.store.delete_setting("dashboard_auth_config");
     Response::builder()

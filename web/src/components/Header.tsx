@@ -8,6 +8,8 @@ import {
   KeyRound,
   CheckCircle2,
   LogOut,
+  Lock,
+  Unlock,
 } from "lucide-react";
 import { Button, Badge } from "./ui/primitives";
 import { ALL_NAV_ITEMS, type NavTab } from "./Sidebar";
@@ -27,6 +29,7 @@ export function Header({
   onToggleAppearance,
   onRefresh,
   onOpenApiKey,
+  onOpenSecurity,
   onLogout,
 }: {
   activeTab: NavTab;
@@ -42,6 +45,7 @@ export function Header({
   onToggleAppearance: () => void;
   onRefresh: () => void;
   onOpenApiKey: () => void;
+  onOpenSecurity?: () => void;
   onLogout?: () => void;
 }) {
   const current = ALL_NAV_ITEMS.find((i) => i.id === activeTab);
@@ -136,10 +140,35 @@ export function Header({
           </span>
         </Button>
 
-        {dashboardLocked && onLogout && (
-          <Button variant="ghost" size="icon" onClick={onLogout} title="Sign out of dashboard">
-            <LogOut className="h-4 w-4 text-fg-muted" />
-          </Button>
+        {dashboardLocked ? (
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={onOpenSecurity}
+              title="Dashboard is password-protected (click to manage)"
+              className="hidden h-7 items-center gap-1 rounded-full border border-success/35 bg-success/10 px-2.5 text-[11px] font-medium text-success transition-colors hover:bg-success/15 md:inline-flex cursor-pointer"
+            >
+              <Lock className="h-3 w-3" />
+              Locked
+            </button>
+            {onLogout && (
+              <Button variant="ghost" size="icon" onClick={onLogout} title="Sign out of dashboard">
+                <LogOut className="h-4 w-4 text-fg-muted" />
+              </Button>
+            )}
+          </div>
+        ) : (
+          onOpenSecurity && (
+            <button
+              type="button"
+              onClick={onOpenSecurity}
+              title="Dashboard UI is unlocked — click to set a password"
+              className="hidden h-7 items-center gap-1 rounded-full border border-warning/40 bg-warning/10 px-2.5 text-[11px] font-medium text-warning transition-colors hover:bg-warning/15 md:inline-flex cursor-pointer"
+            >
+              <Unlock className="h-3 w-3" />
+              Unlocked
+            </button>
+          )
         )}
 
         <Badge variant="success" className="hidden xl:inline-flex font-mono">

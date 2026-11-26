@@ -28,7 +28,16 @@ fn json_status(status: StatusCode, body: Value) -> Response {
 
 // ── Health ──────────────────────────────────────────────────────────
 
-pub async fn api_health(State(state): State<SharedState>) -> Response {
+pub async fn api_health(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if state.is_dashboard_locked() && crate::part_a::authorize_management(&state, &headers).is_err() {
+        // Minimal public liveness probe when Dashboard Password Lock is active:
+        // never leak OAuth emails, usage totals, or provider details to unauthenticated callers.
+        return json_ok(json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "dashboard_locked": true,
+        }));
+    }
     json_ok(build_health_json(&state))
 }
 
@@ -91,8 +100,12 @@ pub struct ProviderQuery {
 
 pub async fn list_providers(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(query): Query<ProviderQuery>,
 ) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     json_ok(build_providers_json(
         &state,
         query.q.as_deref(),
@@ -152,8 +165,12 @@ fn build_providers_json(
 
 pub async fn get_provider(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     let catalog = state.catalog.read().unwrap();
     match catalog.find(&id) {
         Some(p) => json_ok(serde_json::to_value(p).unwrap_or(json!({}))),
@@ -319,7 +336,10 @@ fn default_true() -> bool {
     true
 }
 
-pub async fn list_combos(State(state): State<SharedState>) -> Response {
+pub async fn list_combos(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     let combos = state.store.list_combos().unwrap_or_default();
     json_ok(json!({
         "strategies": PUBLIC_STRATEGIES.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -327,7 +347,14 @@ pub async fn list_combos(State(state): State<SharedState>) -> Response {
     }))
 }
 
-pub async fn get_combo(State(state): State<SharedState>, Path(id): Path<String>) -> Response {
+pub async fn get_combo(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     match state.store.get_combo(&id) {
         Ok(Some(c)) => json_ok(serde_json::to_value(c).unwrap_or(json!({}))),
         _ => json_status(StatusCode::NOT_FOUND, json!({"error": "combo not found"})),
@@ -389,8 +416,12 @@ pub struct SimulateBody {
 
 pub async fn simulate_route(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<SimulateBody>,
 ) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     let strat_override = body.strategy.as_deref().map(normalize_strategy);
     let (used_strategy, is_combo, ordered) = expand_and_order_candidates(
         &state,
@@ -501,8 +532,14 @@ pub async fn delete_key(
 
 // ── Settings, Usage, Guardrails, Gamification, MITM ─────────────────
 
-pub async fn get_settings(State(state): State<SharedState>) -> Response {
-    let map = state.store.list_settings().unwrap_or_default();
+pub async fn get_settings(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
+    let mut map = state.store.list_settings().unwrap_or_default();
+    // Never expose hashed password / session signing secret / raw webhook & telegram tokens here
+    map.remove("dashboard_auth_config");
+    map.remove("alerting_config");
     json_ok(json!({
         "default_strategy": state.default_strategy().as_str(),
         "guardrails_enabled": state.guardrails_enabled(),
@@ -524,6 +561,10 @@ pub async fn put_settings(
     let now = now_ms();
     if let Some(obj) = body.as_object() {
         for (k, v) in obj {
+            // Protect dedicated auth/alert settings from generic settings overwrite
+            if k == "dashboard_auth_config" || k == "alerting_config" {
+                continue;
+            }
             let val_str = match v {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -531,15 +572,21 @@ pub async fn put_settings(
             let _ = state.store.set_setting(k, &val_str, now);
         }
     }
-    get_settings(State(state)).await
+    get_settings(State(state), headers).await
 }
 
-pub async fn get_usage(State(state): State<SharedState>) -> Response {
+pub async fn get_usage(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     let summary = state.store.usage_summary().unwrap_or_else(|_| json!({}));
     json_ok(summary)
 }
 
-pub async fn guardrails_status(State(state): State<SharedState>) -> Response {
+pub async fn guardrails_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     let events = state.store.list_guardrail_events(25).unwrap_or_default();
     json_ok(json!({
         "enabled": state.guardrails_enabled(),
@@ -580,11 +627,17 @@ pub async fn add_guardrail_pattern(
     json_status(StatusCode::CREATED, json!({"ok": true, "name": body.name}))
 }
 
-pub async fn gamification_status(State(state): State<SharedState>) -> Response {
+pub async fn gamification_status(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     json_ok(state.gamification_summary())
 }
 
-pub async fn mitm_targets(State(state): State<SharedState>) -> Response {
+pub async fn mitm_targets(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     json_ok(state.mitm_status_json())
 }
 
@@ -709,7 +762,13 @@ pub async fn mitm_set_bypass(
 
 // ── Compression & Semantic Cache Management APIs ────────────────────
 
-pub async fn get_compression_settings(State(state): State<SharedState>) -> Response {
+pub async fn get_compression_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     json_ok(state.compression_summary())
 }
 
@@ -728,7 +787,10 @@ pub async fn put_compression_settings(
     json_ok(state.compression_summary())
 }
 
-pub async fn get_cache_stats(State(state): State<SharedState>) -> Response {
+pub async fn get_cache_stats(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = crate::part_a::authorize_management(&state, &headers) {
+        return resp;
+    }
     json_ok(state.cache_summary())
 }
 

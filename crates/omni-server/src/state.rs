@@ -114,6 +114,7 @@ pub struct AppState {
     pub mitm_handle: Mutex<Option<MitmProxyHandle>>,
     pub mitm_bypass: RwLock<Vec<String>>,
     pub alert_dedup: Mutex<HashMap<String, i64>>,
+    login_failures: Mutex<HashMap<String, (u32, Instant)>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +135,35 @@ impl AppState {
         let mitm_ca = CertAuthority::load_or_create(&mitm_dir)
             .or_else(|_| CertAuthority::generate())
             .map_err(|e| anyhow::anyhow!("MITM CA init: {e}"))?;
+        // Optional env bootstrap: seed Dashboard Password Lock if OMNIROUTE_DASHBOARD_PASSWORD is set
+        // and no dashboard_auth_config has been persisted yet.
+        if let Ok(env_pw) = std::env::var("OMNIROUTE_DASHBOARD_PASSWORD") {
+            let pw = env_pw.trim();
+            let already_set = store
+                .get_setting("dashboard_auth_config")
+                .ok()
+                .flatten()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if pw.len() >= 4 && !already_set {
+                let salt = uuid::Uuid::new_v4().simple().to_string();
+                let session_secret = format!(
+                    "{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    uuid::Uuid::new_v4().simple()
+                );
+                let cfg = DashboardAuthConfig {
+                    enabled: true,
+                    salt: salt.clone(),
+                    password_hash: Self::hash_dashboard_password(&salt, pw),
+                    session_secret,
+                    updated_at: now_ms(),
+                };
+                if let Ok(serialized) = serde_json::to_string(&cfg) {
+                    let _ = store.set_setting("dashboard_auth_config", &serialized, now_ms());
+                }
+            }
+        }
         Ok(Self {
             data_dir: data_dir.to_string(),
             store,
@@ -153,6 +183,7 @@ impl AppState {
             mitm_handle: Mutex::new(None),
             mitm_bypass: RwLock::new(vec![]),
             alert_dedup: Mutex::new(HashMap::new()),
+            login_failures: Mutex::new(HashMap::new()),
         })
     }
 
@@ -522,6 +553,48 @@ impl AppState {
         }
         let expected = sign_session_payload(&cfg.session_secret, payload);
         constant_time_eq(sig.as_bytes(), expected.as_bytes())
+    }
+
+    /// Anti-brute-force rate limiter for `/api/auth/login`: max 5 consecutive failures per 5 min.
+    pub fn check_login_rate_limit(&self, client_key: &str) -> Result<(), u64> {
+        const MAX_FAILURES: u32 = 5;
+        const WINDOW_SECS: u64 = 300;
+        let mut map = self.login_failures.lock().unwrap();
+        let now = Instant::now();
+        // Prune stale entries so map stays bounded
+        map.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < WINDOW_SECS);
+        if let Some((count, first_or_last)) = map.get(client_key) {
+            let elapsed = now.duration_since(*first_or_last).as_secs();
+            if *count >= MAX_FAILURES && elapsed < WINDOW_SECS {
+                return Err(WINDOW_SECS - elapsed);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_login_failure(&self, client_key: &str) -> (u32, Option<u64>) {
+        const MAX_FAILURES: u32 = 5;
+        const WINDOW_SECS: u64 = 300;
+        let mut map = self.login_failures.lock().unwrap();
+        let now = Instant::now();
+        let entry = map.entry(client_key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1).as_secs() >= WINDOW_SECS {
+            *entry = (1, now);
+        } else {
+            entry.0 += 1;
+            entry.1 = now;
+        }
+        let count = entry.0;
+        let retry = if count >= MAX_FAILURES {
+            Some(WINDOW_SECS)
+        } else {
+            None
+        };
+        (count, retry)
+    }
+
+    pub fn clear_login_failures(&self, client_key: &str) {
+        self.login_failures.lock().unwrap().remove(client_key);
     }
 
     pub fn mitm_status_json(&self) -> serde_json::Value {

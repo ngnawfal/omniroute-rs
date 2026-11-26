@@ -241,7 +241,10 @@ pub async fn retrieve_memories(
     )
 }
 
-pub async fn memory_health(State(state): State<SharedState>) -> Response {
+pub async fn memory_health(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize_management(&state, &headers) {
+        return resp;
+    }
     let (_, total, tokens_used) = state
         .store
         .list_memories(None, None, None, None, None, now_ms(), 1, 0)
